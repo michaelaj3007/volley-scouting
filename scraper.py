@@ -743,33 +743,55 @@ def enrich_cvf_player_bio(session, rec):
 
 
 def get_table_context_title(table):
+    parts = []
     prev = table.find_previous(["h1", "h2", "h3", "h4", "caption"])
-    return normalize_header(prev.get_text()) if prev else ""
+    if prev:
+        parts.append(normalize_header(prev.get_text()))
+    card = table.find_parent(class_=re.compile(r"card|panel|box|block|section|tab-pane", re.IGNORECASE))
+    if card:
+        hdr = card.find(class_=re.compile(r"header|title|heading", re.IGNORECASE))
+        if hdr:
+            parts.append(normalize_header(hdr.get_text()))
+    return " | ".join(dict.fromkeys(p for p in parts if p))
 
 
 def parse_cvf_table(table, league, page_url):
     base = league["base_url"].rstrip("/")
     rows = table.find_all("tr")
-    if len(rows) < 3:
+    if len(rows) < 2:
         return []
 
     ctx_title = get_table_context_title(table)
 
     header_row_idx = None
     headers = []
+    stat_keywords = [
+        "hráč", "hrac", "příjmení", "prijmeni", "jméno", "jmeno", "player",
+        "klub", "družstvo", "druzstvo", "tým", "tym", "sety", "body", "esa",
+        "bloky", "blok", "útok", "utok", "příjem", "prijem", "záp", "zap", "poř", "por",
+    ]
     for r_i, tr in enumerate(rows[:4]):
         h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
         joined = " ".join(h_cells)
-        if any(k in joined for k in ["hráč", "hrac", "příjmení", "prijmeni", "jméno", "jmeno", "player"]):
+        if len(h_cells) >= 3 and any(k in joined for k in stat_keywords):
             header_row_idx = r_i
             headers = h_cells
             break
 
+    data_start_idx = (header_row_idx + 1) if header_row_idx is not None else 0
     if header_row_idx is None:
-        return []
+        # Check if rows contain player links (/hrac) even without a recognizable header row
+        has_player_links = any(
+            tr.find("a", href=re.compile(r"/hrac|player", re.IGNORECASE))
+            for tr in rows[:6]
+        )
+        if not has_player_links:
+            return []
+        first_cells = [clean_text(c.get_text()) for c in rows[0].find_all(["td", "th"])]
+        headers = [f"col_{i}" for i in range(len(first_cells))]
 
     group_map = {}
-    if header_row_idx > 0:
+    if header_row_idx is not None and header_row_idx > 0:
         col_cursor = 0
         for cell in rows[0].find_all(["th", "td"]):
             span = int(cell.get("colspan", 1))
@@ -782,7 +804,7 @@ def parse_cvf_table(table, league, page_url):
 
     col_map = {h: i for i, h in enumerate(headers) if h}
 
-    i_name = find_col(col_map, ["hráč", "hrac", "player"])
+    i_name = find_col(col_map, ["hráč", "hrac", "player", "příjmení a jméno", "prijmeni a jmeno"])
     i_surname = find_col(col_map, ["příjmení", "prijmeni", "surname"])
     i_firstname = find_col(col_map, ["jméno", "jmeno", "name"])
     i_team = find_col(col_map, ["družstvo", "druzstvo", "tým", "tym", "klub", "team"])
@@ -792,7 +814,41 @@ def parse_cvf_table(table, league, page_url):
     i_matches = find_col(col_map, ["záp.", "zap.", "z", "utk.", "utkání", "matches"])
     i_sets = find_col(col_map, ["sety", "s", "sets"])
 
-    # Determine if this table is a single-skill leaderboard table or a combined stats table
+    # Auto-infer player name & team columns from <a> links when headers are blank
+    sample_trs = rows[data_start_idx : data_start_idx + 5]
+    if i_name is None and i_surname is None:
+        link_col_hits = {}
+        text_col_hits = {}
+        for tr in sample_trs:
+            tds = tr.find_all(["td", "th"])
+            for c_i, td in enumerate(tds):
+                if c_i == i_team:
+                    continue
+                txt = clean_text(td.get_text())
+                if not txt or re.fullmatch(r"[\d.,%+\- ]+", txt):
+                    continue
+                a = td.find("a", href=True)
+                if a and ("/hrac" in a["href"].lower() or "player" in a["href"].lower()):
+                    link_col_hits[c_i] = link_col_hits.get(c_i, 0) + 1
+                elif len(txt) >= 4:
+                    text_col_hits[c_i] = text_col_hits.get(c_i, 0) + 1
+        if link_col_hits:
+            i_name = max(link_col_hits, key=link_col_hits.get)
+        elif text_col_hits:
+            i_name = sorted(text_col_hits.keys())[0]
+
+    if i_team is None:
+        for tr in sample_trs:
+            for c_i, td in enumerate(tr.find_all(["td", "th"])):
+                if c_i == i_name:
+                    continue
+                a = td.find("a", href=True)
+                if a and any(k in a["href"].lower() for k in ["/druzstvo", "/tym", "/klub", "team"]):
+                    i_team = c_i
+                    break
+            if i_team is not None:
+                break
+
     is_block_table = "blok" in ctx_title and not group_map
     is_serve_table = ("podán" in ctx_title or "podan" in ctx_title or "esa" in ctx_title) and not group_map
     is_attack_table = ("útok" in ctx_title or "utok" in ctx_title or "smeč" in ctx_title) and not group_map
@@ -857,9 +913,9 @@ def parse_cvf_table(table, league, page_url):
                     i_blk = idx
 
     records = []
-    for tr in rows[header_row_idx + 1 :]:
+    for tr in rows[data_start_idx:]:
         cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-        if len(cells) < 4:
+        if len(cells) < 3:
             continue
 
         if i_surname is not None and i_firstname is not None:
@@ -875,248 +931,7 @@ def parse_cvf_table(table, league, page_url):
             continue
 
         team_name = cell_val(cells, i_team)
-        link = tr.find("a", href=True)
+        link = tr.find("a", href=re.compile(r"/hrac|player", re.IGNORECASE)) or tr.find("a", href=True)
         p_url = urljoin(base + "/", link["href"]) if link else page_url
         pl_id_match = re.search(r"(\d{2,})", p_url)
-        pl_id = pl_id_match.group(1) if pl_id_match else re.sub(r"\W+", "_", f"{p_name}_{team_name}".lower())
-
-        sets = to_int(cell_val(cells, i_sets))
-        pts = to_int(cell_val(cells, i_pts))
-        aces = to_int(cell_val(cells, i_aces))
-        blocks = to_int(cell_val(cells, i_blk))
-        h_cm = to_int(cell_val(cells, i_height))
-        if h_cm < 140 or h_cm > 235:
-            h_cm = 0
-
-        b_raw = cell_val(cells, i_birth)
-        ym = re.search(r"(19\d{2}|20[0-1]\d)", b_raw)
-        b_year = int(ym.group(1)) if ym else 0
-        age = (datetime.now().year - b_year) if b_year else 0
-        raw_pos = cell_val(cells, i_pos)
-
-        records.append({
-            "player_id": f"{league['country']}_{league['competition_id']}_{pl_id}",
-            "league": league["name"],
-            "country": league["country"],
-            "gender": league.get("gender", ""),
-            "name": p_name,
-            "team": team_name,
-            "position": normalize_position(raw_pos),
-            "raw_position": raw_pos,
-            "height_cm": h_cm,
-            "birth_year": b_year,
-            "age": age,
-            "nationality": "CZE",
-            "matches": to_int(cell_val(cells, i_matches)),
-            "sets": sets,
-            "points": pts,
-            "points_per_set": round(pts / sets, 2) if sets > 0 else 0.0,
-            "break_points": 0,
-            "won_lost": 0,
-            "serve_total": to_int(cell_val(cells, i_s_tot)),
-            "aces": aces,
-            "aces_per_set": round(aces / sets, 2) if sets > 0 else 0.0,
-            "serve_errors": to_int(cell_val(cells, i_s_err)),
-            "blocks": blocks,
-            "blocks_per_set": round(blocks / sets, 2) if sets > 0 else 0.0,
-            "attack_total": to_int(cell_val(cells, i_atk_tot)),
-            "attack_points": to_int(cell_val(cells, i_atk_pts)),
-            "attack_errors": 0,
-            "attack_blocked": 0,
-            "attack_pct": to_float(cell_val(cells, i_atk_pct)),
-            "attack_eff_pct": 0.0,
-            "reception_total": to_int(cell_val(cells, i_rec_tot)),
-            "reception_pos_pct": to_float(cell_val(cells, i_rec_pct)),
-            "reception_perf_pct": to_float(cell_val(cells, i_rec_perf)),
-            "profile_url": p_url,
-            "photo_url": "",
-        })
-
-    return records
-
-
-def merge_cvf_records(merged_map, new_records):
-    num_fields = [
-        "matches", "sets", "points", "serve_total", "aces", "serve_errors",
-        "blocks", "attack_total", "attack_points", "attack_pct",
-        "reception_total", "reception_pos_pct", "reception_perf_pct",
-        "height_cm", "birth_year", "age",
-    ]
-    for r in new_records:
-        key = r["player_id"]
-        if key not in merged_map:
-            merged_map[key] = r
-            continue
-        cur = merged_map[key]
-        for f in num_fields:
-            if r.get(f, 0) > cur.get(f, 0):
-                cur[f] = r[f]
-        if cur["position"] == "Unknown" and r["position"] != "Unknown":
-            cur["position"] = r["position"]
-            cur["raw_position"] = r["raw_position"]
-        if not cur["team"] and r["team"]:
-            cur["team"] = r["team"]
-        if "/hrac" in r.get("profile_url", "").lower():
-            cur["profile_url"] = r["profile_url"]
-
-        sets = cur["sets"]
-        cur["points_per_set"] = round(cur["points"] / sets, 2) if sets > 0 else 0.0
-        cur["aces_per_set"] = round(cur["aces"] / sets, 2) if sets > 0 else 0.0
-        cur["blocks_per_set"] = round(cur["blocks"] / sets, 2) if sets > 0 else 0.0
-
-
-def scrape_cvf_cz_league(browser, session, league):
-    """Dedicated scraper for Czech Volleyball Federation portal (dv.cvf.cz/statistika/zebricky/...)."""
-    base = league["base_url"].rstrip("/")
-    entry_url = league["url"]
-    merged_map = {}
-
-    context = browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent=HEADERS["User-Agent"],
-    )
-    page = context.new_page()
-
-    try:
-        urls_to_visit = [entry_url]
-        visited = set()
-
-        while urls_to_visit and len(visited) < 10:
-            s_url = urls_to_visit.pop(0)
-            if s_url in visited:
-                continue
-            visited.add(s_url)
-
-            print(f"[{league['name']}] Opening {s_url}")
-            try:
-                resp = page.goto(s_url, wait_until="networkidle", timeout=40000)
-                if resp and resp.status >= 400:
-                    continue
-            except Exception as exc:
-                print(f"[WARN] CVF navigation error on {s_url}: {exc}")
-                continue
-
-            # Expand DataTables page size if present
-            try:
-                for sel in page.locator("select[name*='length']").all():
-                    for opt_val in ["-1", "500", "250", "100"]:
-                        if sel.locator(f"option[value='{opt_val}']").count() > 0:
-                            sel.select_option(opt_val)
-                            page.wait_for_timeout(800)
-                            break
-            except Exception:
-                pass
-
-            s_soup = BeautifulSoup(page.content(), "lxml")
-
-            # Discover any category sub-links under /zebricky/2026-27/ex-m/
-            if s_url == entry_url:
-                for a in s_soup.find_all("a", href=True):
-                    href = urljoin(base + "/", a["href"])
-                    if "/zebricky/2026-27/ex-m" in href.lower() and href not in visited and href not in urls_to_visit:
-                        urls_to_visit.append(href)
-
-            for table in s_soup.find_all("table"):
-                parsed = parse_cvf_table(table, league, s_url)
-                if parsed:
-                    merge_cvf_records(merged_map, parsed)
-
-        records = list(merged_map.values())
-        print(f"[{league['name']}] Total merged Czech players: {len(records)}")
-
-        if records:
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [executor.submit(enrich_cvf_player_bio, session, r) for r in records]
-                records = [fut.result() for fut in as_completed(futures)]
-
-    except Exception as exc:
-        print(f"[WARN] CVF scraper error: {exc}")
-    finally:
-        context.close()
-
-    return records
-
-
-def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
-    if not os.path.exists(overrides_path) or df.empty:
-        return df
-    try:
-        ov = pd.read_csv(overrides_path)
-        if "player_id" not in ov.columns:
-            return df
-        ov_map = ov.set_index("player_id").to_dict(orient="index")
-        for idx, row in df.iterrows():
-            pid = row["player_id"]
-            if pid in ov_map:
-                h = ov_map[pid].get("height_cm", 0)
-                if pd.notna(h) and int(float(h)) > 0:
-                    df.at[idx, "height_cm"] = int(float(h))
-                pos = ov_map[pid].get("position", "")
-                if pd.notna(pos) and str(pos).strip():
-                    df.at[idx, "position"] = str(pos).strip()
-    except Exception as exc:
-        print(f"[WARN] Could not apply manual overrides: {exc}")
-    return df
-
-
-def main():
-    with open("leagues.json", "r", encoding="utf-8") as f:
-        leagues = json.load(f)
-
-    all_records = []
-    session = get_session()
-
-    if not HAS_PLAYWRIGHT:
-        raise RuntimeError("Playwright is required to scrape JavaScript tables.")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            for league in leagues:
-                print(f"=== Processing {league['name']} ===")
-                l_type = league.get("type", "dataproject")
-
-                if l_type == "cvf_cz":
-                    cvf_records = scrape_cvf_cz_league(browser, session, league)
-                    all_records.extend(cvf_records)
-                    continue
-
-                cand_urls = resolve_dataproject_stats_urls(session, league)
-                players = scrape_all_players_playwright(browser, league, cand_urls)
-                players = discover_extra_players_from_teams(session, league, players)
-
-                items = list(players.items())
-                with ThreadPoolExecutor(max_workers=12) as executor:
-                    futures = {
-                        executor.submit(enrich_player_profile, league, pl_id, pdata): pl_id
-                        for pl_id, pdata in items
-                    }
-                    for fut in as_completed(futures):
-                        rec = fut.result()
-                        if rec:
-                            all_records.append(rec)
-        finally:
-            browser.close()
-
-    os.makedirs("data", exist_ok=True)
-    df = pd.DataFrame(all_records)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["player_id"], keep="first")
-        df = apply_manual_overrides(df)
-        df = df.sort_values(by=["points", "name"], ascending=[False, True])
-
-    df.to_csv("data/players.csv", index=False, encoding="utf-8-sig")
-
-    meta = {
-        "last_updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "total_players": len(df),
-        "leagues": [l["name"] for l in leagues],
-    }
-    with open("data/last_updated.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    print(f"=== DONE: Saved {len(df)} players across {len(leagues)} leagues to data/players.csv ===")
-
-
-if __name__ == "__main__":
-    main()
+        pl_id = pl_id_match.group(1) if pl_id_match else re.sub(r"\W+", "_", f"{p_name}_{team
