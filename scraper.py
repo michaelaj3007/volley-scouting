@@ -22,14 +22,22 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Specific/compound roles MUST appear before shorter substrings (e.g. feladóátló before feladó, högerspiker before spiker)
 ROLE_MAP = {
-    "setter": "Setter",
+    "feladóátló": "Opposite",
+    "feladoatlo": "Opposite",
+    "högerspiker": "Opposite",
+    "hogerspiker": "Opposite",
+    "vänsterspiker": "Outside Hitter",
+    "vansterspiker": "Outside Hitter",
     "opposite": "Opposite",
     "universal": "Opposite",
+    "diagonal": "Opposite",
+    "setter": "Setter",
     "outside": "Outside Hitter",
     "wing": "Outside Hitter",
-    "spiker": "Outside Hitter",
     "receiver": "Outside Hitter",
+    "spiker": "Outside Hitter",
     "middle": "Middle Blocker",
     "blocker": "Middle Blocker",
     "libero": "Libero",
@@ -50,10 +58,9 @@ ROLE_MAP = {
     "schiacciatore": "Outside Hitter",
     "centrale": "Middle Blocker",
     "passare": "Setter",
-    "högerspiker": "Opposite",
-    "vänsterspiker": "Outside Hitter",
     "center": "Middle Blocker",
     "feladó": "Setter",
+    "felado": "Setter",
     "átló": "Opposite",
     "négyesütő": "Outside Hitter",
     "szélső": "Outside Hitter",
@@ -70,6 +77,7 @@ ROLE_MAP = {
     "passari": "Setter",
     "hakkuri": "Opposite",
     "yleispelaaja": "Outside Hitter",
+    "keskipelaaja": "Middle Blocker",
     "keskitorjuja": "Middle Blocker",
     "nahrávač": "Setter",
     "univerzál": "Opposite",
@@ -79,12 +87,21 @@ ROLE_MAP = {
     "blokár": "Middle Blocker",
 }
 
-KNOWN_BIO_LABELS = {
-    "shirt number", "club", "team", "position", "role",
-    "heigth", "height", "înălțime", "inaltime", "ύψος", "výška",
-    "date of birth", "birth date", "birth place", "ημ. γέννησης",
-    "sport nationality", "nationality", "εθνικότητα",
-}
+SHIRT_LABELS = ("shirt number", "tröjnummer", "mez száma", "mezszám", "číslo dresu", "pelinumero", "αριθμός", "número")
+CLUB_LABELS = ("club", "team", "förening", "egyesület", "seura", "klub")
+POS_LABELS = ("position", "role", "roll", "poszt", "pelipaikka", "pozícia", "pozicia", "pozicija", "post", "пост", "θέση")
+HEIGHT_LABELS = ("heigth", "height", "längd", "magasság", "pituus", "výška", "vyska", "visina", "înălțime", "inaltime", "ύψος", "ръст")
+BIRTH_LABELS = ("date of birth", "birth date", "födelsedata", "születési dátum", "syntymäaika", "dátum narodenia", "datum narození", "ημ. γέννησης")
+NAT_LABELS = ("sport nationality", "nationality", "urheilukansallisuus", "národnosť", "narodnost", "nationalitet", "εθνικότητα")
+
+KNOWN_BIO_LABELS = set(
+    SHIRT_LABELS + CLUB_LABELS + POS_LABELS + HEIGHT_LABELS + BIRTH_LABELS + NAT_LABELS
+    + (
+        "birth place", "moderklubb", "születési hely", "syntymäpaikka", "miesto narodenia",
+        "reach", "jump", "räckhöjd", "spikehöjd", "kurotus", "ulottuvuus", "dosah",
+        "history", "historik", "historia", "notes", "statistics",
+    )
+)
 
 
 def get_session():
@@ -130,6 +147,13 @@ def normalize_position(raw):
         if key in low:
             return mapped
     return clean_text(raw) if clean_text(raw) else "Unknown"
+
+
+def first_bio(bio, keys):
+    for k in keys:
+        if bio.get(k):
+            return bio[k]
+    return ""
 
 
 def extract_query_param(url, param_name):
@@ -203,10 +227,10 @@ def parse_radgrid_page(soup, league):
         return {}
 
     i_pid = find_col(headers, ["playerid", "player id", "id"])
-    i_player = find_col(headers, ["player", "jucător", "jucator", "igrac", "igrač", "hráč", "играч", "παίκτης"])
+    i_player = find_col(headers, ["player", "jucător", "jucator", "igrac", "igrač", "hráč", "играч", "παίκτης", "spelare", "játékos", "pelaaja"])
     i_surname = find_col(headers, ["surname", "last name"])
     i_name = find_col(headers, ["name", "first name"])
-    i_team = find_col(headers, ["team", "echipa", "club", "klub", "družstvo", "tým", "отбор", "ομάδα"])
+    i_team = find_col(headers, ["team", "echipa", "club", "klub", "družstvo", "tým", "отбор", "ομάδα", "lag", "csapat", "joukkue"])
     i_country = find_col(headers, ["country", "nation", "nat"])
     i_matches = find_col(headers, ["matches", "meciuri", "played", "m", "z"])
     i_sets = find_col(headers, ["sets", "seturi", "s"])
@@ -464,7 +488,7 @@ def enrich_player_profile(league, pl_id, data):
 
         for i, line in enumerate(lines):
             low = line.rstrip(":").lower()
-            if low in ("shirt number", "número", "αριθμός") and i > 0 and not name_guess:
+            if low in SHIRT_LABELS and i > 0 and not name_guess:
                 for back in range(1, min(4, i + 1)):
                     cand = re.sub(r"^\d+\s+", "", lines[i - back]).strip()
                     if cand and len(cand) >= 3 and cand.lower() not in KNOWN_BIO_LABELS:
@@ -484,20 +508,20 @@ def enrich_player_profile(league, pl_id, data):
                 name = name_guess
 
         if not team:
-            team = bio.get("club") or bio.get("team") or ""
-        raw_pos = bio.get("position") or bio.get("role") or ""
+            team = first_bio(bio, CLUB_LABELS)
+        raw_pos = first_bio(bio, POS_LABELS)
 
-        h_val = to_int(bio.get("heigth") or bio.get("height") or bio.get("înălțime") or bio.get("inaltime") or bio.get("ύψος") or "")
+        h_val = to_int(first_bio(bio, HEIGHT_LABELS))
         if 140 <= h_val <= 235:
             height_cm = h_val
 
-        ym = re.search(r"(19\d{2}|20[0-1]\d)", bio.get("date of birth") or bio.get("birth date") or bio.get("ημ. γέννησης") or "")
+        ym = re.search(r"(19\d{2}|20[0-1]\d)", first_bio(bio, BIRTH_LABELS))
         if ym:
             birth_year = int(ym.group(1))
             age = datetime.now().year - birth_year
 
         if not nationality:
-            nationality = bio.get("sport nationality") or bio.get("nationality") or bio.get("εθνικότητα") or ""
+            nationality = first_bio(bio, NAT_LABELS)
 
         img = soup.find("img", id=re.compile(r"player|photo|img", re.IGNORECASE))
         if img and img.get("src"):
