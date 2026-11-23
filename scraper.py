@@ -210,3 +210,55 @@ def resolve_dataproject_stats_urls(session, league):
 
     if not pid:
         home_html = html.unescape(fetch_html(session, f"{base}/CompetitionHome.aspx?ID={cid}"))
+        if home_html:
+            for m in re.findall(r"Statistics(?:_AllPlayers)?\.aspx\?[^\"'<>\s)]+", home_html, re.IGNORECASE):
+                found_pid = extract_query_param(urljoin(base + "/", m), "PID")
+                if found_pid:
+                    cand = f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={found_pid}"
+                    if cand not in urls:
+                        urls.insert(0, cand)
+                    break
+    return urls
+
+
+def parse_radgrid_page(soup, league):
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
+
+    headers = []
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr")[:5]:
+            h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
+            if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
+                headers = h_cells
+                break
+        if headers:
+            break
+
+    if not headers:
+        return {}, 0
+
+    i_pid = find_col(headers, ["playerid", "player id", "id"])
+    i_player = find_col(headers, ["player", "jucător", "jucator", "igrac", "igrač", "hráč", "играч", "παίκτης"])
+    i_surname = find_col(headers, ["surname", "last name"])
+    i_name = find_col(headers, ["name", "first name"])
+    i_team = find_col(headers, ["team", "echipa", "club", "klub", "družstvo", "tým", "отбор", "ομάδα"])
+    i_country = find_col(headers, ["country", "nation", "nat"])
+    i_matches = find_col(headers, ["matches", "meciuri", "played", "m", "z"])
+    i_sets = find_col(headers, ["sets", "seturi", "s"])
+    i_points = find_col(headers, ["points", "puncte", "pts", "tot", "b"])
+    i_bp = find_col(headers, ["bp", "break points"])
+    i_wl = find_col(headers, ["w-p", "w-l", "wl"])
+
+    i_s_err = find_col(headers, ["s =", "s=", "s err"])
+    i_s_ok = find_col(headers, ["s !", "s!"])
+    i_s_slash = find_col(headers, ["s /", "s/"])
+    i_s_neg = find_col(headers, ["s -", "s-"])
+    i_s_pos = find_col(headers, ["s +", "s+"])
+    i_s_ace = find_col(headers, ["s #", "s#", "s pts", "aces", "ace"])
+
+    i_r_err = find_col(headers, ["r =", "r=", "r err"])
+    i_r_ok = find_col(headers, ["r !", "r!"])
+    i_r_slash = find_col(headers, ["r /", "r/"])
+    i_r_neg = find_col(headers, ["r -", "r-"])
+    i_r_pos = find_col(headers, ["r +",
