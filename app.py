@@ -5,19 +5,57 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Volley Scouting Dashboard",
+    page_title="MSA Volley Scouting",
     page_icon="🏐",
     layout="wide",
 )
 
 DATA_PATH = "data/players.csv"
 META_PATH = "data/last_updated.json"
+OVERRIDES_PATH = "data/manual_overrides.csv"
+
+
+def get_app_password():
+    try:
+        return str(st.secrets.get("APP_PASSWORD", "")).strip()
+    except Exception:
+        return ""
+
+
+def check_password():
+    """Προστασία με κωδικό από τα Streamlit Secrets (δεν φαίνεται στον δημόσιο κώδικα)."""
+    app_pwd = get_app_password()
+    if not app_pwd:
+        return False  # Δεν έχει οριστεί ακόμα κωδικός
+
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, center, _ = st.columns([1, 1.4, 1])
+    with center:
+        st.title("🏐 MSA Volley Scouting")
+        st.caption("Περιορισμένη πρόσβαση — Εισάγετε τον κωδικό σας.")
+        with st.form("login_form"):
+            entered = st.text_input("Κωδικός πρόσβασης", type="password", placeholder="••••••••")
+            submitted = st.form_submit_button("Είσοδος", use_container_width=True)
+            if submitted:
+                if entered == app_pwd:
+                    st.session_state["authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("Λάθος κωδικός. Δοκιμάστε ξανά.")
+    st.stop()
+
+
+is_protected = check_password()
 
 
 @st.cache_data(ttl=300)
 def load_data():
     if not os.path.exists(DATA_PATH):
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, pd.DataFrame()
+
     df = pd.read_csv(DATA_PATH)
     meta = {}
     if os.path.exists(META_PATH):
@@ -36,16 +74,58 @@ def load_data():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    for col in ["name", "team", "league", "country", "position", "nationality", "profile_url", "photo_url"]:
+    for col in [
+        "player_id", "name", "team", "league", "country", "gender",
+        "position", "nationality", "profile_url", "photo_url",
+    ]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
 
-    return df, meta
+    df["raw_height_cm"] = df["height_cm"].astype(int)
+    df["notes"] = ""
+
+    overrides_df = pd.DataFrame(columns=["player_id", "name", "team", "height_cm", "position", "notes"])
+    if os.path.exists(OVERRIDES_PATH):
+        try:
+            ov = pd.read_csv(OVERRIDES_PATH)
+            if "player_id" in ov.columns:
+                overrides_df = ov.copy()
+                ov_map = ov.set_index("player_id").to_dict(orient="index")
+                for idx, row in df.iterrows():
+                    pid = row["player_id"]
+                    if pid in ov_map:
+                        h = ov_map[pid].get("height_cm", 0)
+                        if pd.notna(h) and int(float(h)) > 0:
+                            df.at[idx, "height_cm"] = int(float(h))
+                        pos = ov_map[pid].get("position", "")
+                        if pd.notna(pos) and str(pos).strip():
+                            df.at[idx, "position"] = str(pos).strip()
+                        note = ov_map[pid].get("notes", "")
+                        if pd.notna(note) and str(note).strip():
+                            df.at[idx, "notes"] = str(note).strip()
+        except Exception:
+            pass
+
+    return df, meta, overrides_df
 
 
-df, meta = load_data()
+df, meta, overrides_df = load_data()
 
-st.title("🏐 Volley Scouting Dashboard")
+# Header
+head_left, head_right = st.columns([5, 1])
+with head_left:
+    st.title("🏐 MSA Volley Scouting")
+with head_right:
+    if is_protected:
+        if st.button("🔒 Έξοδος", use_container_width=True):
+            st.session_state["authenticated"] = False
+            st.rerun()
+
+if not is_protected:
+    st.info(
+        "🔓 **Ο κωδικός εισόδου δεν έχει ενεργοποιηθεί ακόμα.** "
+        "Πάτα **Manage app** κάτω δεξιά -> **⋮ -> Settings -> Secrets** και πρόσθεσε: `APP_PASSWORD = \"ο_κωδικός_σου\"`."
+    )
 
 if df.empty:
     st.warning("Δεν υπάρχουν ακόμα δεδομένα. Τρέξε το Daily Volleyball Stats Update από το GitHub Actions.")
@@ -57,7 +137,13 @@ st.caption(f"Τελευταία αυτόματη ενημέρωση: **{last_upd
 # -------------------- SIDEBAR FILTERS --------------------
 st.sidebar.header("🔍 Φίλτρα Scouting")
 
-search_name = st.sidebar.text_input("Αναζήτηση αθλητή / ομάδας", placeholder="π.χ. Balashov ή Galati...")
+search_name = st.sidebar.text_input("Αναζήτηση αθλητή / ομάδας", placeholder="π.χ. Jovovic ή Galati...")
+
+genders_opt = sorted([x for x in df["gender"].unique() if x])
+if len(genders_opt) > 1:
+    sel_genders = st.sidebar.multiselect("Κατηγορία (Άνδρες / Γυναίκες)", genders_opt, default=genders_opt)
+else:
+    sel_genders = genders_opt
 
 leagues_opt = sorted([x for x in df["league"].unique() if x])
 sel_leagues = st.sidebar.multiselect("Πρωτάθλημα", leagues_opt, default=leagues_opt)
@@ -76,7 +162,7 @@ st.sidebar.subheader("📏 Σωματότυπος & Ηλικία")
 
 min_height = st.sidebar.slider("Ελάχιστο Ύψος (cm)", min_value=165, max_value=220, value=165, step=1)
 include_unknown_height = st.sidebar.checkbox(
-    "Εμφάνιση και όσων δεν έχουν δηλωμένο ύψος (0 cm)",
+    "Εμφάνιση και όσων δεν έχουν δηλωμένο ύψος",
     value=(min_height == 165),
     help="Απενεργοποίησέ το όταν ψάχνεις αυστηρά παίκτες πάνω από συγκεκριμένο ύψος.",
 )
@@ -93,6 +179,8 @@ min_blk_set = st.sidebar.number_input("Ελάχιστα Μπλοκ / Σετ", mi
 
 # Apply filters
 fdf = df.copy()
+if sel_genders:
+    fdf = fdf[fdf["gender"].isin(sel_genders)]
 if sel_leagues:
     fdf = fdf[fdf["league"].isin(sel_leagues)]
 if sel_positions:
@@ -107,6 +195,7 @@ if search_name.strip():
     fdf = fdf[
         fdf["name"].str.lower().str.contains(q, na=False)
         | fdf["team"].str.lower().str.contains(q, na=False)
+        | fdf["notes"].str.lower().str.contains(q, na=False)
     ]
 
 if include_unknown_height:
@@ -134,10 +223,11 @@ k3.metric("Κορυφαίος Σκόρερ", f"{int(fdf['points'].max())} π." i
 k4.metric("Κορυφαίος Μπλοκέρ", f"{int(fdf['blocks'].max())} μπλ." if not fdf.empty else "—")
 
 # -------------------- TABS --------------------
-tab_leaders, tab_db, tab_card = st.tabs([
+tab_leaders, tab_db, tab_card, tab_overrides = st.tabs([
     "🏆 Καθημερινές Κατατάξεις",
     "📋 Βάση Αθλητών & Φίλτρα",
     "👤 Καρτέλα Αθλητή",
+    "✏️ Ύψη & Σημειώσεις",
 ])
 
 with tab_leaders:
@@ -152,49 +242,51 @@ with tab_leaders:
     if ldf.empty:
         st.info("Δεν βρέθηκαν αθλητές με αυτά τα κριτήρια. Μείωσε τα ελάχιστα σετ ή άνοιξε τα φίλτρα αριστερά.")
     else:
-        def show_board(title, data, sort_col, extra_cols):
+        def show_board(title, data, sort_col, stat_cols):
             st.markdown(f"### {title}")
-            cols = ["name", "team", "position", "height_cm", "age", "sets"] + extra_cols
+            # Τα βασικά νούμερα ακριβώς δίπλα στο όνομα — μηδέν scroll!
+            cols = ["name"] + stat_cols + ["team", "position", "height_cm", "sets"]
             view = data.sort_values(by=sort_col, ascending=False).head(top_n)[cols].reset_index(drop=True)
+            view["height_cm"] = view["height_cm"].replace(0, pd.NA)
             view.index = view.index + 1
             st.dataframe(
                 view,
                 use_container_width=True,
                 column_config={
-                    "name": "Αθλητής",
-                    "team": "Ομάδα",
-                    "position": "Θέση",
-                    "height_cm": st.column_config.NumberColumn("Ύψος", format="%d cm"),
-                    "age": "Ηλικία",
-                    "sets": "Σετ",
-                    "points": "Πόντοι",
-                    "points_per_set": st.column_config.NumberColumn("Πόντοι/Σετ", format="%.2f"),
-                    "aces": "Άσοι",
-                    "aces_per_set": st.column_config.NumberColumn("Άσοι/Σετ", format="%.2f"),
-                    "serve_total": "Σερβίς",
-                    "blocks": "Μπλοκ",
-                    "blocks_per_set": st.column_config.NumberColumn("Μπλοκ/Σετ", format="%.2f"),
-                    "attack_total": "Επιθέσεις",
-                    "attack_points": "Επιθ. Π.",
-                    "attack_pct": st.column_config.NumberColumn("Επίθεση %", format="%.1f%%"),
-                    "attack_eff_pct": st.column_config.NumberColumn("Αποτελ. %", format="%.1f%%"),
-                    "reception_total": "Υποδοχές",
-                    "reception_pos_pct": st.column_config.NumberColumn("Θετ. Υπ. %", format="%.1f%%"),
-                    "reception_perf_pct": st.column_config.NumberColumn("Άριστη %", format="%.1f%%"),
+                    "name": st.column_config.TextColumn("Αθλητής", width="medium"),
+                    "team": st.column_config.TextColumn("Ομάδα", width="medium"),
+                    "position": st.column_config.TextColumn("Θέση", width="small"),
+                    "height_cm": st.column_config.NumberColumn("Ύψος", format="%d cm", width="small"),
+                    "sets": st.column_config.NumberColumn("Σετ", format="%d", width="small"),
+                    "points": st.column_config.NumberColumn("Πόντοι", format="%d", width="small"),
+                    "points_per_set": st.column_config.NumberColumn("Π/Σετ", format="%.2f", width="small"),
+                    "aces": st.column_config.NumberColumn("Άσοι", format="%d", width="small"),
+                    "aces_per_set": st.column_config.NumberColumn("Άσοι/Σετ", format="%.2f", width="small"),
+                    "blocks": st.column_config.NumberColumn("Μπλοκ", format="%d", width="small"),
+                    "blocks_per_set": st.column_config.NumberColumn("Μπλ/Σετ", format="%.2f", width="small"),
+                    "attack_points": st.column_config.NumberColumn("Επιθ.Π", format="%d", width="small"),
+                    "attack_pct": st.column_config.NumberColumn("Επίθ.%", format="%.1f%%", width="small"),
+                    "attack_eff_pct": st.column_config.NumberColumn("Αποτ.%", format="%.1f%%", width="small"),
+                    "reception_total": st.column_config.NumberColumn("Υπ.", format="%d", width="small"),
+                    "reception_pos_pct": st.column_config.NumberColumn("Θετ.%", format="%.1f%%", width="small"),
+                    "reception_perf_pct": st.column_config.NumberColumn("Άρ.%", format="%.1f%%", width="small"),
                 },
             )
 
         col_a, col_b = st.columns(2)
         with col_a:
-            s_col = "points_per_set" if rank_mode == "Ανά Σετ (μ.ό.)" else "points"
-            show_board("🔥 Καλύτερος Σκόρερ", ldf, s_col, ["points", "points_per_set"])
-
-            b_col = "blocks_per_set" if rank_mode == "Ανά Σετ (μ.ό.)" else "blocks"
-            show_board("🧱 Καλύτερος Μπλοκέρ", ldf, b_col, ["blocks", "blocks_per_set"])
+            if rank_mode == "Ανά Σετ (μ.ό.)":
+                show_board("🔥 Καλύτερος Σκόρερ", ldf, "points_per_set", ["points_per_set", "points"])
+                show_board("🧱 Καλύτερος Μπλοκέρ", ldf, "blocks_per_set", ["blocks_per_set", "blocks"])
+            else:
+                show_board("🔥 Καλύτερος Σκόρερ", ldf, "points", ["points", "points_per_set"])
+                show_board("🧱 Καλύτερος Μπλοκέρ", ldf, "blocks", ["blocks", "blocks_per_set"])
 
         with col_b:
-            sv_col = "aces_per_set" if rank_mode == "Ανά Σετ (μ.ό.)" else "aces"
-            show_board("🎯 Καλύτερος Σέρβερ", ldf, sv_col, ["aces", "aces_per_set", "serve_total"])
+            if rank_mode == "Ανά Σετ (μ.ό.)":
+                show_board("🎯 Καλύτερος Σέρβερ", ldf, "aces_per_set", ["aces_per_set", "aces"])
+            else:
+                show_board("🎯 Καλύτερος Σέρβερ", ldf, "aces", ["aces", "aces_per_set"])
 
             atk_df = ldf[ldf["attack_total"] >= 15]
             if atk_df.empty:
@@ -203,7 +295,7 @@ with tab_leaders:
                 "⚡ Καλύτερος Επιθετικός (min 15 επιθ.)",
                 atk_df,
                 "attack_pct",
-                ["attack_pct", "attack_eff_pct", "attack_points", "attack_total"],
+                ["attack_pct", "attack_eff_pct", "attack_points"],
             )
 
         rec_df = ldf[ldf["reception_total"] >= 15]
@@ -222,11 +314,15 @@ with tab_db:
         "matches", "sets", "points", "points_per_set",
         "aces", "aces_per_set", "blocks", "blocks_per_set",
         "attack_points", "attack_pct", "attack_eff_pct",
-        "reception_pos_pct", "reception_perf_pct", "profile_url",
+        "reception_pos_pct", "reception_perf_pct", "notes", "profile_url",
     ]
     available_cols = [c for c in display_cols if c in fdf.columns]
+    db_view = fdf[available_cols].copy()
+    db_view["height_cm"] = db_view["height_cm"].replace(0, pd.NA)
+    db_view["age"] = db_view["age"].replace(0, pd.NA)
+
     st.dataframe(
-        fdf[available_cols],
+        db_view,
         use_container_width=True,
         hide_index=True,
         height=600,
@@ -236,7 +332,7 @@ with tab_db:
             "league": "Πρωτάθλημα",
             "position": "Θέση",
             "height_cm": st.column_config.NumberColumn("Ύψος", format="%d cm"),
-            "age": "Ηλικία",
+            "age": st.column_config.NumberColumn("Ηλικία", format="%d"),
             "nationality": "Εθν.",
             "matches": "Αγ.",
             "sets": "Σετ",
@@ -251,6 +347,7 @@ with tab_db:
             "attack_eff_pct": st.column_config.NumberColumn("Αποτ. %", format="%.1f%%"),
             "reception_pos_pct": st.column_config.NumberColumn("Υπ. Θετ.%", format="%.1f%%"),
             "reception_perf_pct": st.column_config.NumberColumn("Υπ. Άρ.%", format="%.1f%%"),
+            "notes": "Σημειώσεις",
             "profile_url": st.column_config.LinkColumn("Προφίλ", display_text="Άνοιγμα ↗"),
         },
     )
@@ -268,11 +365,10 @@ with tab_card:
     if fdf.empty:
         st.info("Δεν υπάρχουν αθλητές με τα τρέχοντα φίλτρα.")
     else:
-        options = fdf.sort_values("name")["name"] + " — " + fdf.sort_values("name")["team"]
         sorted_fdf = fdf.sort_values("name").reset_index(drop=True)
-        chosen = st.selectbox("Διάλεξε αθλητή", options.tolist())
-        idx = options.tolist().index(chosen)
-        p = sorted_fdf.iloc[idx]
+        options = (sorted_fdf["name"] + " — " + sorted_fdf["team"]).tolist()
+        chosen = st.selectbox("Διάλεξε αθλητή", options)
+        p = sorted_fdf.iloc[options.index(chosen)]
 
         c1, c2 = st.columns([1, 3])
         with c1:
@@ -284,6 +380,8 @@ with tab_card:
             st.markdown(f"**Ύψος:** {int(p['height_cm'])} cm" if p["height_cm"] > 0 else "**Ύψος:** Μη δηλωμένο")
             st.markdown(f"**Ηλικία:** {int(p['age'])} ({int(p['birth_year'])})" if p["age"] > 0 else "**Ηλικία:** —")
             st.markdown(f"**Εθνικότητα:** {p['nationality']}")
+            if p["notes"]:
+                st.info(f"📝 **Σημείωση:** {p['notes']}")
             if p["profile_url"]:
                 st.link_button("Επίσημο Προφίλ ↗", p["profile_url"])
 
@@ -299,3 +397,83 @@ with tab_card:
             m6.metric("Αποτελεσματ. %", f"{p['attack_eff_pct']:.1f}%")
             m7.metric("Θετική Υποδοχή %", f"{p['reception_pos_pct']:.1f}%")
             m8.metric("Άριστη Υποδοχή %", f"{p['reception_perf_pct']:.1f}%")
+
+with tab_overrides:
+    st.subheader("✏️ Συμπλήρωση Υψών & Προσωπικών Σημειώσεων")
+    st.markdown(
+        "Επειδή κάποιες ομοσπονδίες δεν περνάνε το ύψος όλων των αθλητών, μπορείς να το συμπληρώσεις εδώ "
+        "(μαζί με δικές σου σημειώσεις, π.χ. *«Ελεύθερος το καλοκαίρι»* ή *«Πολύ καλό άλμα»*). "
+        "Ό,τι αποθηκεύσεις στο `data/manual_overrides.csv` **μένει μόνιμα** και δεν σβήνεται ποτέ από τις καθημερινές ανανεώσεις."
+    )
+
+    only_missing = st.checkbox("Εμφάνιση μόνο αθλητών χωρίς ύψος", value=True)
+    edit_source = df[df["height_cm"] == 0].copy() if only_missing else df.copy()
+    edit_source = edit_source.sort_values(by=["points", "name"], ascending=[False, True])
+
+    editor_cols = ["player_id", "name", "team", "position", "height_cm", "notes"]
+    edited_df = st.data_editor(
+        edit_source[editor_cols],
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+        disabled=["player_id", "name", "team"],
+        column_config={
+            "player_id": st.column_config.TextColumn("ID", width="small"),
+            "name": "Αθλητής",
+            "team": "Ομάδα",
+            "position": st.column_config.SelectboxColumn(
+                "Θέση",
+                options=["Setter", "Opposite", "Outside Hitter", "Middle Blocker", "Libero", "Unknown"],
+            ),
+            "height_cm": st.column_config.NumberColumn("Ύψος (cm)", min_value=0, max_value=235, step=1),
+            "notes": st.column_config.TextColumn("Σημειώσεις Agent", width="large"),
+        },
+    )
+
+    # Συγχώνευση παλιών overrides με όσα μόλις συμπλήρωσες
+    merged_records = {}
+    if not overrides_df.empty and "player_id" in overrides_df.columns:
+        for _, r in overrides_df.iterrows():
+            pid = str(r["player_id"])
+            merged_records[pid] = {
+                "player_id": pid,
+                "name": str(r.get("name", "")),
+                "team": str(r.get("team", "")),
+                "height_cm": int(float(r["height_cm"])) if pd.notna(r.get("height_cm")) else 0,
+                "position": str(r.get("position", "")) if pd.notna(r.get("position")) else "",
+                "notes": str(r.get("notes", "")) if pd.notna(r.get("notes")) else "",
+            }
+
+    raw_height_map = df.set_index("player_id")["raw_height_cm"].to_dict()
+    for _, r in edited_df.iterrows():
+        pid = str(r["player_id"])
+        h_new = int(r["height_cm"]) if pd.notna(r["height_cm"]) else 0
+        note_new = str(r["notes"]).strip() if pd.notna(r["notes"]) else ""
+        h_raw = int(raw_height_map.get(pid, 0))
+        if (h_new > 0 and h_new != h_raw) or note_new or (pid in merged_records):
+            merged_records[pid] = {
+                "player_id": pid,
+                "name": str(r["name"]),
+                "team": str(r["team"]),
+                "height_cm": h_new,
+                "position": str(r["position"]),
+                "notes": note_new,
+            }
+
+    if merged_records:
+        out_df = pd.DataFrame(list(merged_records.values()))
+        csv_text = out_df.to_csv(index=False)
+        st.success(f"Έτοιμες **{len(out_df)}** καταχωρήσεις για μόνιμη αποθήκευση.")
+        st.markdown(
+            "**Πώς τις αποθηκεύεις μόνιμα (10 δευτερόλεπτα):** Πάτα το εικονίδιο αντιγραφής πάνω δεξιά στο πλαίσιο παρακάτω "
+            "και κάνε paste στο αρχείο `data/manual_overrides.csv` στο GitHub."
+        )
+        st.code(csv_text, language="csv")
+        st.download_button(
+            "⬇️ Ή κατέβασε το manual_overrides.csv",
+            data=csv_text.encode("utf-8-sig"),
+            file_name="manual_overrides.csv",
+            mime="text/csv",
+        )
+    else:
+        st.caption("Συμπλήρωσε ένα ύψος ή μια σημείωση στον πίνακα παραπάνω για να δημιουργηθεί το αρχείο αποθήκευσης.")
