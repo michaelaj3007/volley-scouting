@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import re
@@ -52,20 +53,20 @@ def get_session():
     return s
 
 
-def fetch_soup(session, url, timeout=25):
+def fetch_html(session, url, timeout=25):
     try:
         resp = session.get(url, timeout=timeout)
         resp.raise_for_status()
-        return BeautifulSoup(resp.text, "lxml")
+        return resp.text
     except Exception as exc:
         print(f"[WARN] Failed to fetch {url}: {exc}")
-        return None
+        return ""
 
 
 def clean_text(text):
     if not text:
         return ""
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", str(text)).strip()
 
 
 def to_float(val):
@@ -101,7 +102,237 @@ def extract_query_param(url, param_name):
     return ""
 
 
-def discover_teams_and_players(session, league):
+def normalize_header(h):
+    return re.sub(r"\s+", " ", clean_text(h).lower())
+
+
+def find_col(col_map, exact_candidates, contains_candidates=None):
+    for cand in exact_candidates:
+        c_norm = normalize_header(cand)
+        if c_norm in col_map:
+            return col_map[c_norm]
+        c_nospace = c_norm.replace(" ", "")
+        for h, idx in col_map.items():
+            if h.replace(" ", "") == c_nospace:
+                return idx
+    if contains_candidates:
+        for cand in contains_candidates:
+            c_norm = normalize_header(cand)
+            for h, idx in col_map.items():
+                if c_norm in h:
+                    return idx
+    return None
+
+
+def cell_val(cells, idx, default=""):
+    if idx is not None and 0 <= idx < len(cells):
+        return cells[idx]
+    return default
+
+
+def scrape_all_players_table(session, league):
+    """Reads the complete Data Project Statistics_AllPlayers.aspx master table."""
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
+    pid = str(league.get("pid", ""))
+
+    urls = []
+    if pid:
+        urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}")
+    urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}")
+
+    players = {}
+
+    for url in urls:
+        raw_html = fetch_html(session, url)
+        if not raw_html:
+            continue
+        soup = BeautifulSoup(raw_html, "lxml")
+
+        target_table = None
+        header_row_idx = 0
+        headers = []
+
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+            for r_i, tr in enumerate(rows[:4]):
+                h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
+                if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
+                    target_table = table
+                    header_row_idx = r_i
+                    headers = h_cells
+                    break
+            if target_table:
+                break
+
+        if not target_table:
+            continue
+
+        print(f"[DEBUG] AllPlayers FULL headers ({len(headers)} cols): {headers}")
+
+        col_map = {}
+        for i, h in enumerate(headers):
+            if h and h not in col_map:
+                col_map[h] = i
+
+        i_pid = find_col(col_map, ["playerid", "player id", "id"])
+        i_player = find_col(col_map, ["player", "jucător", "jucator"])
+        i_surname = find_col(col_map, ["surname", "last name"])
+        i_name = find_col(col_map, ["name", "first name"])
+        i_team = find_col(col_map, ["team", "echipa", "club"])
+        i_country = find_col(col_map, ["country", "nation", "nat"])
+        i_matches = find_col(col_map, ["matches", "meciuri", "played", "m"])
+        i_sets = find_col(col_map, ["sets", "seturi", "s"])
+        i_points = find_col(col_map, ["points", "puncte", "pts", "tot"])
+        i_bp = find_col(col_map, ["bp", "break points"])
+        i_wl = find_col(col_map, ["w-p", "w-l", "wl"])
+
+        # Serve columns (DataVolley notation: s =, s !, s /, s -, s +, s #, s tot)
+        i_s_err = find_col(col_map, ["s =", "s=", "s err", "srv err"])
+        i_s_ok = find_col(col_map, ["s !", "s!"])
+        i_s_slash = find_col(col_map, ["s /", "s/"])
+        i_s_neg = find_col(col_map, ["s -", "s-"])
+        i_s_pos = find_col(col_map, ["s +", "s+"])
+        i_s_ace = find_col(col_map, ["s #", "s#", "s pts", "aces", "ace", "srv pts"])
+        i_s_tot = find_col(col_map, ["s tot", "stot", "srv tot"])
+
+        # Reception columns (r =, r /, r -, r !, r +, r #, r tot)
+        i_r_err = find_col(col_map, ["r =", "r=", "r err"])
+        i_r_slash = find_col(col_map, ["r /", "r/"])
+        i_r_neg = find_col(col_map, ["r -", "r-"])
+        i_r_ok = find_col(col_map, ["r !", "r!"])
+        i_r_pos = find_col(col_map, ["r +", "r+"])
+        i_r_perf = find_col(col_map, ["r #", "r#"])
+        i_r_tot = find_col(col_map, ["r tot", "rtot", "rec tot"])
+        i_r_pos_pct = find_col(col_map, ["r pos%", "pos%", "rec pos%", "r %"])
+        i_r_perf_pct = find_col(col_map, ["r perf%", "r exc%", "perf%", "exc%"])
+
+        # Attack columns (a =, a /, a -, a !, a +, a #, a tot, a %)
+        i_a_err = find_col(col_map, ["a =", "a=", "a err"])
+        i_a_blk = find_col(col_map, ["a /", "a/", "a blk"])
+        i_a_neg = find_col(col_map, ["a -", "a-"])
+        i_a_ok = find_col(col_map, ["a !", "a!"])
+        i_a_pos = find_col(col_map, ["a +", "a+"])
+        i_a_pts = find_col(col_map, ["a #", "a#", "a pts", "atk pts", "attack pts"])
+        i_a_tot = find_col(col_map, ["a tot", "atot", "atk tot"])
+        i_a_pct = find_col(col_map, ["a %", "a%", "a exc%", "atk %", "attack %"])
+
+        # Block columns (b =, b /, b -, b !, b +, b #, b pts)
+        i_b_pts = find_col(col_map, ["b #", "b#", "b pts", "blk", "blocks", "block", "bl"])
+
+        data_rows = target_table.find_all("tr")[header_row_idx + 1 :]
+        sample_printed = False
+
+        for tr in data_rows:
+            cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
+            if len(cells) < max(5, len(headers) // 2):
+                continue
+
+            pl_id = re.sub(r"[^0-9]", "", cell_val(cells, i_pid))
+            if not pl_id:
+                link = tr.find("a", href=re.compile(r"PlayerID=", re.IGNORECASE))
+                if link:
+                    pl_id = extract_query_param(urljoin(base + "/", link["href"]), "PlayerID")
+            if not pl_id:
+                continue
+
+            if not sample_printed:
+                print(f"[DEBUG] Sample AllPlayers row: {cells[:25]}")
+                sample_printed = True
+
+            first_n = cell_val(cells, i_name)
+            last_n = cell_val(cells, i_surname)
+            full_name = f"{first_n} {last_n}".strip() if (first_n or last_n) else cell_val(cells, i_player)
+
+            matches = to_int(cell_val(cells, i_matches))
+            sets = to_int(cell_val(cells, i_sets))
+            points = to_int(cell_val(cells, i_points))
+            bp = to_int(cell_val(cells, i_bp))
+            wl = to_int(cell_val(cells, i_wl))
+
+            # Serve
+            s_err = to_int(cell_val(cells, i_s_err))
+            s_ok = to_int(cell_val(cells, i_s_ok))
+            s_slash = to_int(cell_val(cells, i_s_slash))
+            s_neg = to_int(cell_val(cells, i_s_neg))
+            s_pos = to_int(cell_val(cells, i_s_pos))
+            aces = to_int(cell_val(cells, i_s_ace))
+            s_tot = to_int(cell_val(cells, i_s_tot))
+            if s_tot == 0:
+                s_tot = s_err + s_ok + s_slash + s_neg + s_pos + aces
+
+            # Reception
+            r_err = to_int(cell_val(cells, i_r_err))
+            r_slash = to_int(cell_val(cells, i_r_slash))
+            r_neg = to_int(cell_val(cells, i_r_neg))
+            r_ok = to_int(cell_val(cells, i_r_ok))
+            r_pos = to_int(cell_val(cells, i_r_pos))
+            r_perf = to_int(cell_val(cells, i_r_perf))
+            r_tot = to_int(cell_val(cells, i_r_tot))
+            if r_tot == 0:
+                r_tot = r_err + r_slash + r_neg + r_ok + r_pos + r_perf
+            rec_pos_pct = to_float(cell_val(cells, i_r_pos_pct))
+            if rec_pos_pct == 0.0 and r_tot > 0:
+                rec_pos_pct = round(100.0 * (r_pos + r_perf) / r_tot, 1)
+            rec_perf_pct = to_float(cell_val(cells, i_r_perf_pct))
+            if rec_perf_pct == 0.0 and r_tot > 0:
+                rec_perf_pct = round(100.0 * r_perf / r_tot, 1)
+
+            # Attack
+            a_err = to_int(cell_val(cells, i_a_err))
+            a_blk = to_int(cell_val(cells, i_a_blk))
+            a_neg = to_int(cell_val(cells, i_a_neg))
+            a_ok = to_int(cell_val(cells, i_a_ok))
+            a_pos = to_int(cell_val(cells, i_a_pos))
+            a_pts = to_int(cell_val(cells, i_a_pts))
+            a_tot = to_int(cell_val(cells, i_a_tot))
+            if a_tot == 0:
+                a_tot = a_err + a_blk + a_neg + a_ok + a_pos + a_pts
+            atk_pct = to_float(cell_val(cells, i_a_pct))
+            if atk_pct == 0.0 and a_tot > 0:
+                atk_pct = round(100.0 * a_pts / a_tot, 1)
+            atk_eff_pct = round(100.0 * (a_pts - a_err - a_blk) / a_tot, 1) if a_tot > 0 else 0.0
+
+            # Block
+            blocks = to_int(cell_val(cells, i_b_pts))
+
+            players[pl_id] = {
+                "pl_id": pl_id,
+                "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
+                "name": full_name,
+                "team": cell_val(cells, i_team),
+                "country": cell_val(cells, i_country),
+                "matches": matches,
+                "sets": sets,
+                "points": points,
+                "break_points": bp,
+                "won_lost": wl,
+                "serve_total": s_tot,
+                "aces": aces,
+                "serve_errors": s_err,
+                "reception_total": r_tot,
+                "reception_pos_pct": rec_pos_pct,
+                "reception_perf_pct": rec_perf_pct,
+                "attack_total": a_tot,
+                "attack_points": a_pts,
+                "attack_errors": a_err,
+                "attack_blocked": a_blk,
+                "attack_pct": atk_pct,
+                "attack_eff_pct": atk_eff_pct,
+                "blocks": blocks,
+            }
+
+        if players:
+            print(f"[{league['name']}] Loaded {len(players)} players from {url}")
+            break
+
+    return players
+
+
+def discover_extra_players_from_teams(session, league, existing_players):
+    """Also scans team rosters (including onclick JS) to catch players with 0 sets played."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", ""))
@@ -109,69 +340,61 @@ def discover_teams_and_players(session, league):
     seed_urls = [
         f"{base}/CompetitionTeamSearch.aspx?ID={cid}",
         f"{base}/CompetitionPlayerSearch.aspx?ID={cid}",
-        f"{base}/CompetitionStandings.aspx?ID={cid}&PID={pid}" if pid else f"{base}/CompetitionStandings.aspx?ID={cid}",
-        f"{base}/CompetitionMatches.aspx?ID={cid}&PID={pid}" if pid else f"{base}/CompetitionMatches.aspx?ID={cid}",
     ]
+    if pid:
+        seed_urls.append(f"{base}/CompetitionStandings.aspx?ID={cid}&PID={pid}")
 
     team_urls = set()
-    player_entries = {}  # player_id -> dict(url, name, team)
+    found_ids = set()
 
     for url in seed_urls:
-        soup = fetch_soup(session, url)
-        if not soup:
+        raw_html = html.unescape(fetch_html(session, url))
+        if not raw_html:
             continue
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            full = urljoin(base + "/", href)
-            low = full.lower()
-            if "competitionteamdetails.aspx" in low:
-                team_urls.add(full)
-            elif "playerdetails.aspx" in low:
-                pl_id = extract_query_param(full, "PlayerID")
-                if pl_id and pl_id not in player_entries:
-                    player_entries[pl_id] = {
-                        "url": full,
-                        "name_hint": clean_text(a.get_text()),
-                        "team_hint": "",
-                    }
+        for m in re.findall(r"CompetitionTeamDetails\.aspx\?[^\"'<>\s]+", raw_html, re.IGNORECASE):
+            team_urls.add(urljoin(base + "/", m))
+        for m in re.findall(r"PlayerID=(\d+)", raw_html, re.IGNORECASE):
+            found_ids.add(m)
 
-    print(f"[{league['name']}] Discovered {len(team_urls)} team pages, {len(player_entries)} initial players.")
-
-    # Visit every team roster page to ensure 100% of players are captured
     for t_url in sorted(team_urls):
-        soup = fetch_soup(session, t_url)
-        if not soup:
+        raw_html = html.unescape(fetch_html(session, t_url))
+        if not raw_html:
             continue
+        for m in re.findall(r"PlayerID=(\d+)", raw_html, re.IGNORECASE):
+            found_ids.add(m)
 
-        team_name = ""
-        for sel in ["#Content_Main_LBL_TeamName", "h1", "h2", ".TeamName", "[id*='TeamName']"]:
-            el = soup.select_one(sel)
-            if el and clean_text(el.get_text()):
-                team_name = clean_text(el.get_text())
-                break
+    added = 0
+    for pl_id in found_ids:
+        if pl_id not in existing_players:
+            existing_players[pl_id] = {
+                "pl_id": pl_id,
+                "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
+                "name": "",
+                "team": "",
+                "country": "",
+                "matches": 0,
+                "sets": 0,
+                "points": 0,
+                "break_points": 0,
+                "won_lost": 0,
+                "serve_total": 0,
+                "aces": 0,
+                "serve_errors": 0,
+                "reception_total": 0,
+                "reception_pos_pct": 0.0,
+                "reception_perf_pct": 0.0,
+                "attack_total": 0,
+                "attack_points": 0,
+                "attack_errors": 0,
+                "attack_blocked": 0,
+                "attack_pct": 0.0,
+                "attack_eff_pct": 0.0,
+                "blocks": 0,
+            }
+            added += 1
 
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "playerdetails.aspx" in href.lower():
-                full = urljoin(base + "/", href)
-                pl_id = extract_query_param(full, "PlayerID")
-                if not pl_id:
-                    continue
-                name_txt = clean_text(a.get_text())
-                if pl_id not in player_entries:
-                    player_entries[pl_id] = {
-                        "url": full,
-                        "name_hint": name_txt,
-                        "team_hint": team_name,
-                    }
-                else:
-                    if team_name and not player_entries[pl_id]["team_hint"]:
-                        player_entries[pl_id]["team_hint"] = team_name
-                    if name_txt and not player_entries[pl_id]["name_hint"]:
-                        player_entries[pl_id]["name_hint"] = name_txt
-
-    print(f"[{league['name']}] Total unique players discovered: {len(player_entries)}")
-    return player_entries
+    print(f"[{league['name']}] Added {added} extra roster players from {len(team_urls)} team pages.")
+    return existing_players
 
 
 def find_by_id_keywords(soup, keywords):
@@ -187,272 +410,101 @@ def find_by_id_keywords(soup, keywords):
 def extract_label_value_pairs(soup):
     pairs = {}
     for row in soup.find_all(["tr", "div", "li", "p"]):
-        spans = row.find_all(["span", "td", "th", "strong", "b", "label"], recursive=False)
-        if len(spans) == 2:
-            k = clean_text(spans[0].get_text()).rstrip(":").lower()
-            v = clean_text(spans[1].get_text())
+        children = row.find_all(["span", "td", "th", "strong", "b", "label", "p"], recursive=False)
+        if len(children) == 2:
+            k = clean_text(children[0].get_text()).rstrip(":").lower()
+            v = clean_text(children[1].get_text())
             if k and v and len(k) < 40 and len(v) < 80:
                 pairs[k] = v
     return pairs
 
 
-def parse_stats_from_tables(soup, debug_first=False):
-    stats = {
-        "matches": 0,
-        "sets": 0,
-        "points": 0,
-        "aces": 0,
-        "serve_errors": 0,
-        "blocks": 0,
-        "attack_points": 0,
-        "attack_pct": 0.0,
-        "reception_pos_pct": 0.0,
-    }
-
-    best_table = None
-    best_headers = []
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            continue
-        header_cells = rows[0].find_all(["th", "td"])
-        headers = [clean_text(c.get_text()).lower() for c in header_cells]
-        joined = " ".join(headers)
-        if any(k in joined for k in ["set", "pts", "tot", "ace", "blk", "block", "puncte", "bloc"]):
-            best_table = table
-            best_headers = headers
-            break
-
-    if not best_table:
-        return stats
-
-    if debug_first:
-        print(f"[DEBUG] Sample player stats table headers: {best_headers}")
-
-    rows = best_table.find_all("tr")[1:]
-    data_rows = []
-    total_row = None
-
-    for tr in rows:
-        cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-        if not cells or len(cells) < 3:
-            continue
-        first_cell = cells[0].lower()
-        if any(w in first_cell for w in ["total", "tot.", "sum"]):
-            total_row = cells
-            break
-        if any(ch.isdigit() for ch in " ".join(cells)):
-            data_rows.append(cells)
-
-    def col_idx(candidates):
-        for cand in candidates:
-            for idx, h in enumerate(best_headers):
-                if cand == h or cand in h:
-                    return idx
-        return None
-
-    idx_matches = col_idx(["matches", "meciuri", "match", "gp", "m"])
-    idx_sets = col_idx(["sets", "seturi", "set", "s"])
-    idx_points = col_idx(["points", "puncte", "pts", "tot"])
-    idx_aces = col_idx(["aces", "ace", "ași", "asi", "srv ace", "as"])
-    idx_blocks = col_idx(["blocks", "blocaje", "block", "blk", "bl"])
-    idx_atk_pts = col_idx(["atk pts", "attack pts", "win", "exc", "atac"])
-    idx_atk_pct = col_idx(["atk %", "attack %", "exc%", "spk%", "atac %"])
-    idx_rec_pct = col_idx(["pos%", "rec%", "rec %", "preluare"])
-
-    if total_row:
-        target_rows = [total_row]
-        is_total = True
-    else:
-        target_rows = data_rows
-        is_total = False
-
-    if not target_rows:
-        return stats
-
-    def get_val(row, idx):
-        if idx is not None and idx < len(row):
-            return row[idx]
-        return "0"
-
-    if is_total:
-        r = target_rows[0]
-        stats["matches"] = to_int(get_val(r, idx_matches))
-        stats["sets"] = to_int(get_val(r, idx_sets))
-        stats["points"] = to_int(get_val(r, idx_points))
-        stats["aces"] = to_int(get_val(r, idx_aces))
-        stats["blocks"] = to_int(get_val(r, idx_blocks))
-        stats["attack_points"] = to_int(get_val(r, idx_atk_pts))
-        stats["attack_pct"] = to_float(get_val(r, idx_atk_pct))
-        stats["reception_pos_pct"] = to_float(get_val(r, idx_rec_pct))
-    else:
-        stats["matches"] = len(target_rows)
-        stats["sets"] = sum(to_int(get_val(r, idx_sets)) for r in target_rows)
-        stats["points"] = sum(to_int(get_val(r, idx_points)) for r in target_rows)
-        stats["aces"] = sum(to_int(get_val(r, idx_aces)) for r in target_rows)
-        stats["blocks"] = sum(to_int(get_val(r, idx_blocks)) for r in target_rows)
-        stats["attack_points"] = sum(to_int(get_val(r, idx_atk_pts)) for r in target_rows)
-        atk_vals = [to_float(get_val(r, idx_atk_pct)) for r in target_rows if to_float(get_val(r, idx_atk_pct)) > 0]
-        rec_vals = [to_float(get_val(r, idx_rec_pct)) for r in target_rows if to_float(get_val(r, idx_rec_pct)) > 0]
-        stats["attack_pct"] = round(sum(atk_vals) / len(atk_vals), 1) if atk_vals else 0.0
-        stats["reception_pos_pct"] = round(sum(rec_vals) / len(rec_vals), 1) if rec_vals else 0.0
-
-    return stats
-
-
-def scrape_league_statistics_pages(session, league):
-    """Also scrapes Statistics_AllPlayers.aspx / Statistics.aspx if available."""
-    base = league["base_url"].rstrip("/")
-    cid = str(league["competition_id"])
-    pid = str(league.get("pid", ""))
-
-    stat_urls = []
-    if pid:
-        stat_urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}")
-        stat_urls.append(f"{base}/Statistics.aspx?ID={cid}&PID={pid}")
-    else:
-        stat_urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}")
-        stat_urls.append(f"{base}/Statistics.aspx?ID={cid}")
-
-    league_stats = {}  # player_id -> dict
-
-    for url in stat_urls:
-        soup = fetch_soup(session, url)
-        if not soup:
-            continue
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            headers = [clean_text(c.get_text()).lower() for c in rows[0].find_all(["th", "td"])]
-            joined = " ".join(headers)
-            if not any(k in joined for k in ["player", "jucător", "jucator", "name", "nume", "pts", "tot", "ace", "blk"]):
-                continue
-
-            print(f"[DEBUG] Found stats table on {url} | headers: {headers[:15]}")
-
-            def idx_of(keys):
-                for k in keys:
-                    for i, h in enumerate(headers):
-                        if k == h or k in h:
-                            return i
-                return None
-
-            i_sets = idx_of(["sets", "seturi", "set", "s"])
-            i_pts = idx_of(["points", "puncte", "pts", "tot"])
-            i_ace = idx_of(["aces", "ace", "ași", "asi", "srv"])
-            i_blk = idx_of(["blocks", "blocaje", "block", "blk", "bl"])
-            i_atk_p = idx_of(["atk %", "attack %", "exc%", "spk%", "atac %"])
-            i_rec_p = idx_of(["pos%", "rec%", "rec %", "preluare"])
-
-            for tr in rows[1:]:
-                link = tr.find("a", href=re.compile(r"PlayerDetails\.aspx", re.IGNORECASE))
-                if not link:
-                    continue
-                pl_id = extract_query_param(urljoin(base + "/", link["href"]), "PlayerID")
-                if not pl_id:
-                    continue
-                cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-                entry = league_stats.setdefault(pl_id, {})
-
-                def pull_int(idx, field):
-                    if idx is not None and idx < len(cells):
-                        v = to_int(cells[idx])
-                        if v > entry.get(field, 0):
-                            entry[field] = v
-
-                def pull_float(idx, field):
-                    if idx is not None and idx < len(cells):
-                        v = to_float(cells[idx])
-                        if v > entry.get(field, 0.0):
-                            entry[field] = v
-
-                pull_int(i_sets, "sets")
-                pull_int(i_pts, "points")
-                pull_int(i_ace, "aces")
-                pull_int(i_blk, "blocks")
-                pull_float(i_atk_p, "attack_pct")
-                pull_float(i_rec_p, "reception_pos_pct")
-
-    print(f"[{league['name']}] Extracted league-table stats for {len(league_stats)} players.")
-    return league_stats
-
-
-def parse_player_page(league, pl_id, info, league_stat_row, debug_first=False):
+def enrich_player_profile(league, pl_id, data, debug_first=False):
     session = get_session()
-    soup = fetch_soup(session, info["url"])
-    if not soup:
-        return None
+    raw_html = fetch_html(session, data["url"])
 
-    pairs = extract_label_value_pairs(soup)
+    name = data["name"]
+    team = data["team"]
+    nationality = data["country"]
+    raw_pos = ""
+    height_cm = 0
+    birth_year = 0
+    age = 0
+    photo_url = ""
 
-    name = (
-        find_by_id_keywords(soup, ["lbl_player", "playername", "lblname", "surname"])
-        or info.get("name_hint", "")
-    )
-    if not name:
-        h = soup.find(["h1", "h2", "h3"])
-        name = clean_text(h.get_text()) if h else f"Player {pl_id}"
+    if raw_html:
+        soup = BeautifulSoup(raw_html, "lxml")
 
-    team = (
-        find_by_id_keywords(soup, ["lbl_team", "teamname", "lblteam"])
-        or info.get("team_hint", "")
-    )
+        if debug_first:
+            lbls = {
+                el.get("id"): clean_text(el.get_text())
+                for el in soup.find_all(id=re.compile(r"LBL_|Content_Main", re.IGNORECASE))
+                if clean_text(el.get_text()) and len(clean_text(el.get_text())) < 80
+            }
+            print(f"[DEBUG] Sample PlayerDetails labels ({data['url']}): {list(lbls.items())[:20]}")
 
-    raw_pos = find_by_id_keywords(soup, ["lbl_role", "position", "role", "ruolo"])
-    if not raw_pos:
-        for k, v in pairs.items():
-            if any(w in k for w in ["role", "position", "post", "rol"]):
-                raw_pos = v
-                break
+        pairs = extract_label_value_pairs(soup)
 
-    raw_height = find_by_id_keywords(soup, ["lbl_height", "height", "altezza", "inaltime"])
-    if not raw_height:
-        for k, v in pairs.items():
-            if any(w in k for w in ["height", "înălțime", "inaltime", "cm"]):
-                raw_height = v
-                break
-    height_cm = to_int(raw_height)
-    if height_cm < 140 or height_cm > 235:
-        height_cm = 0
+        if not name:
+            name = find_by_id_keywords(soup, ["lbl_player", "playername", "lblname", "surname"])
+            if not name:
+                h = soup.find(["h1", "h2", "h3"])
+                name = clean_text(h.get_text()) if h else f"Player {pl_id}"
 
-    raw_birth = find_by_id_keywords(soup, ["lbl_birth", "birthdate", "born", "nascita"])
-    if not raw_birth:
-        for k, v in pairs.items():
-            if any(w in k for w in ["birth", "born", "nașterii", "nasterii", "data"]):
-                raw_birth = v
-                break
-    year_match = re.search(r"(19\d{2}|20[0-1]\d)", raw_birth)
-    birth_year = int(year_match.group(1)) if year_match else 0
-    current_year = datetime.now().year
-    age = (current_year - birth_year) if birth_year > 1950 else 0
+        if not team:
+            team = find_by_id_keywords(soup, ["lbl_team", "teamname", "lblteam"])
 
-    nationality = find_by_id_keywords(soup, ["lbl_nation", "nationality", "citizenship", "country"])
-    if not nationality:
-        for k, v in pairs.items():
-            if any(w in k for w in ["nation", "citizen", "country", "țară", "tara", "național"]):
-                nationality = v
-                break
+        raw_pos = find_by_id_keywords(soup, ["lbl_role", "position", "role", "ruolo", "post"])
+        if not raw_pos:
+            for k, v in pairs.items():
+                if any(w in k for w in ["role", "position", "post", "rol", "ruolo"]):
+                    raw_pos = v
+                    break
 
-    page_stats = parse_stats_from_tables(soup, debug_first=debug_first)
+        raw_height = find_by_id_keywords(soup, ["lbl_height", "height", "altezza", "inaltime"])
+        if not raw_height:
+            for k, v in pairs.items():
+                if any(w in k for w in ["height", "înălțime", "inaltime", "altezza", "cm"]):
+                    raw_height = v
+                    break
+        h_val = to_int(raw_height)
+        if 140 <= h_val <= 235:
+            height_cm = h_val
 
-    # Merge page stats with league summary stats (prefer non-zero higher values)
-    merged = {}
-    for field in ["matches", "sets", "points", "aces", "blocks", "attack_points", "attack_pct", "reception_pos_pct"]:
-        merged[field] = max(page_stats.get(field, 0), league_stat_row.get(field, 0))
+        raw_birth = find_by_id_keywords(soup, ["lbl_birth", "birthdate", "born", "nascita", "dob"])
+        if not raw_birth:
+            for k, v in pairs.items():
+                if any(w in k for w in ["birth", "born", "nașter", "naster", "nascita"]):
+                    raw_birth = v
+                    break
+        ym = re.search(r"(19\d{2}|20[0-1]\d)", raw_birth)
+        if ym:
+            birth_year = int(ym.group(1))
+            age = datetime.now().year - birth_year
 
-    sets = merged["sets"]
-    pts_per_set = round(merged["points"] / sets, 2) if sets > 0 else 0.0
-    aces_per_set = round(merged["aces"] / sets, 2) if sets > 0 else 0.0
-    blocks_per_set = round(merged["blocks"] / sets, 2) if sets > 0 else 0.0
+        if not nationality:
+            nationality = find_by_id_keywords(soup, ["lbl_nation", "nationality", "citizenship", "country"])
+            if not nationality:
+                for k, v in pairs.items():
+                    if any(w in k for w in ["nation", "citizen", "country", "țară", "tara"]):
+                        nationality = v
+                        break
+
+        img = soup.find("img", id=re.compile(r"player|photo|img", re.IGNORECASE))
+        if img and img.get("src"):
+            photo_url = urljoin(league["base_url"].rstrip("/") + "/", img["src"])
+
+    sets = data["sets"]
+    pts_per_set = round(data["points"] / sets, 2) if sets > 0 else 0.0
+    aces_per_set = round(data["aces"] / sets, 2) if sets > 0 else 0.0
+    blocks_per_set = round(data["blocks"] / sets, 2) if sets > 0 else 0.0
 
     return {
         "player_id": f"{league['country']}_{league['competition_id']}_{pl_id}",
         "league": league["name"],
         "country": league["country"],
         "gender": league.get("gender", ""),
-        "name": name,
+        "name": name or f"Player {pl_id}",
         "team": team,
         "position": normalize_position(raw_pos),
         "raw_position": raw_pos,
@@ -460,23 +512,34 @@ def parse_player_page(league, pl_id, info, league_stat_row, debug_first=False):
         "birth_year": birth_year,
         "age": age,
         "nationality": nationality,
-        "matches": merged["matches"],
+        "matches": data["matches"],
         "sets": sets,
-        "points": merged["points"],
+        "points": data["points"],
         "points_per_set": pts_per_set,
-        "aces": merged["aces"],
+        "break_points": data["break_points"],
+        "won_lost": data["won_lost"],
+        "serve_total": data["serve_total"],
+        "aces": data["aces"],
         "aces_per_set": aces_per_set,
-        "blocks": merged["blocks"],
+        "serve_errors": data["serve_errors"],
+        "blocks": data["blocks"],
         "blocks_per_set": blocks_per_set,
-        "attack_points": merged["attack_points"],
-        "attack_pct": merged["attack_pct"],
-        "reception_pos_pct": merged["reception_pos_pct"],
-        "profile_url": info["url"],
+        "attack_total": data["attack_total"],
+        "attack_points": data["attack_points"],
+        "attack_errors": data["attack_errors"],
+        "attack_blocked": data["attack_blocked"],
+        "attack_pct": data["attack_pct"],
+        "attack_eff_pct": data["attack_eff_pct"],
+        "reception_total": data["reception_total"],
+        "reception_pos_pct": data["reception_pos_pct"],
+        "reception_perf_pct": data["reception_perf_pct"],
+        "profile_url": data["url"],
+        "photo_url": photo_url,
     }
 
 
 def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
-    """Keeps any manual heights/notes you add so daily updates never erase them."""
+    """Keeps any manual heights/positions you add so daily updates never erase them."""
     if not os.path.exists(overrides_path) or df.empty:
         return df
     try:
@@ -487,10 +550,12 @@ def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
         for idx, row in df.iterrows():
             pid = row["player_id"]
             if pid in ov_map:
-                if ov_map[pid].get("height_cm", 0) and int(ov_map[pid]["height_cm"]) > 0:
-                    df.at[idx, "height_cm"] = int(ov_map[pid]["height_cm"])
-                if ov_map[pid].get("position"):
-                    df.at[idx, "position"] = ov_map[pid]["position"]
+                h = ov_map[pid].get("height_cm", 0)
+                if pd.notna(h) and int(h) > 0:
+                    df.at[idx, "height_cm"] = int(h)
+                pos = ov_map[pid].get("position", "")
+                if pd.notna(pos) and str(pos).strip():
+                    df.at[idx, "position"] = str(pos).strip()
     except Exception as exc:
         print(f"[WARN] Could not apply manual overrides: {exc}")
     return df
@@ -505,21 +570,20 @@ def main():
 
     for league in leagues:
         print(f"=== Processing {league['name']} ===")
-        player_entries = discover_teams_and_players(session, league)
-        league_stats = scrape_league_statistics_pages(session, league)
+        players = scrape_all_players_table(session, league)
+        players = discover_extra_players_from_teams(session, league, players)
 
-        items = list(player_entries.items())
+        items = list(players.items())
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
                 executor.submit(
-                    parse_player_page,
+                    enrich_player_profile,
                     league,
                     pl_id,
-                    info,
-                    league_stats.get(pl_id, {}),
+                    pdata,
                     idx == 0,
                 ): pl_id
-                for idx, (pl_id, info) in enumerate(items)
+                for idx, (pl_id, pdata) in enumerate(items)
             }
             for fut in as_completed(futures):
                 rec = fut.result()
