@@ -3,8 +3,81 @@
     "name": "Romania - Divizia A1 Men",
     "country": "Romania",
     "gender": "Men",
+    "type": "dataproject",
     "base_url": "https://frv-web.dataproject.com",
     "competition_id": "77",
     "pid": "80"
+  },
+  {
+    "name": "Greece - Volley League Men",
+    "country": "Greece",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://hvl-web.dataproject.com",
+    "competition_id": "55",
+    "pid": ""
+  },
+  {
+    "name": "Sweden - Elitserien",
+    "country": "Sweden",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://svbf-web.dataproject.com",
+    "competition_id": "453",
+    "pid": ""
+  },
+  {
+    "name": "Hungary - Extraliga",
+    "country": "Hungary",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://hvf-web.dataproject.com",
+    "competition_id": "64",
+    "pid": ""
+  },
+  {
+    "name": "Croatia - Superliga",
+    "country": "Croatia",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://hos-web.dataproject.com",
+    "competition_id": "141",
+    "pid": ""
+  },
+  {
+    "name": "Bulgaria - Efbet Super Volley",
+    "country": "Bulgaria",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://bvf-web.dataproject.com",
+    "competition_id": "64",
+    "pid": "65"
+  },
+  {
+    "name": "Finland - Mestaruusliiga",
+    "country": "Finland",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://lml-web.dataproject.com",
+    "competition_id": "156",
+    "pid": ""
+  },
+  {
+    "name": "Slovakia - Niké Extraliga",
+    "country": "Slovakia",
+    "gender": "Men",
+    "type": "dataproject",
+    "base_url": "https://svf-web.dataproject.com",
+    "competition_id": "99",
+    "pid": ""
+  },
+  {
+    "name": "Czech Republic - Extraliga Men",
+    "country": "Czech Republic",
+    "gender": "Men",
+    "type": "cvf_cz",
+    "base_url": "https://dv.cvf.cz",
+    "url": "https://dv.cvf.cz/statistika/utkani/2026-27/ex-m/",
+    "competition_id": "ex-m-2026-27"
   }
 ]
