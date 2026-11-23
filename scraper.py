@@ -22,11 +22,10 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9,cs;q=0.8",
 }
 
 ROLE_MAP = {
-    # English / International
     "setter": "Setter",
     "opposite": "Opposite",
     "universal": "Opposite",
@@ -37,13 +36,11 @@ ROLE_MAP = {
     "middle": "Middle Blocker",
     "blocker": "Middle Blocker",
     "libero": "Libero",
-    # Greek
     "πασαδόρος": "Setter",
     "διαγώνιος": "Opposite",
     "ακραίος": "Outside Hitter",
     "κεντρικός": "Middle Blocker",
     "λίμπερο": "Libero",
-    # Romanian
     "ridicator": "Setter",
     "ridicător": "Setter",
     "fals": "Opposite",
@@ -51,44 +48,41 @@ ROLE_MAP = {
     "extrema": "Outside Hitter",
     "secund": "Outside Hitter",
     "centru": "Middle Blocker",
-    # Italian
     "palleggiatore": "Setter",
     "opposto": "Opposite",
     "schiacciatore": "Outside Hitter",
     "centrale": "Middle Blocker",
-    # Swedish
     "passare": "Setter",
     "högerspiker": "Opposite",
     "vänsterspiker": "Outside Hitter",
     "center": "Middle Blocker",
-    # Hungarian
     "feladó": "Setter",
     "átló": "Opposite",
     "négyesütő": "Outside Hitter",
     "szélső": "Outside Hitter",
     "liberó": "Libero",
-    # Croatian
     "dizač": "Setter",
     "korektor": "Opposite",
     "primač": "Outside Hitter",
     "srednji": "Middle Blocker",
-    # Bulgarian
     "разпределител": "Setter",
     "диагонал": "Opposite",
     "посрещач": "Outside Hitter",
     "център": "Middle Blocker",
     "либеро": "Libero",
-    # Finnish
     "passari": "Setter",
     "hakkuri": "Opposite",
     "yleispelaaja": "Outside Hitter",
     "keskitorjuja": "Middle Blocker",
-    # Czech & Slovak
     "nahrávač": "Setter",
+    "nahravac": "Setter",
     "univerzál": "Opposite",
+    "univerzal": "Opposite",
     "smečař": "Outside Hitter",
+    "smecar": "Outside Hitter",
     "smečiar": "Outside Hitter",
     "blokař": "Middle Blocker",
+    "blokar": "Middle Blocker",
     "blokár": "Middle Blocker",
 }
 
@@ -104,13 +98,18 @@ KNOWN_BIO_LABELS = {
     "inaltime",
     "ύψος",
     "výška",
+    "vyska",
     "date of birth",
     "birth date",
     "birth place",
     "ημ. γέννησης",
+    "datum narození",
+    "ročník",
     "sport nationality",
     "nationality",
     "εθνικότητα",
+    "státní příslušnost",
+    "post",
     "reach",
     "jump",
     "spike",
@@ -200,7 +199,6 @@ def cell_val(cells, idx, default=""):
 
 
 def resolve_dataproject_stats_urls(session, league):
-    """Builds candidate Statistics_AllPlayers.aspx URLs, auto-discovering PID from CompetitionHome if needed."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", "")).strip()
@@ -706,11 +704,272 @@ def enrich_player_profile(league, pl_id, data):
     }
 
 
-def scrape_cvf_cz_league(browser, league):
-    """Dedicated scraper for Czech Volleyball Federation portal (dv.cvf.cz)."""
+def enrich_cvf_player_bio(session, rec):
+    p_url = rec.get("profile_url", "")
+    if not p_url or "/hrac" not in p_url.lower():
+        return rec
+
+    raw_html = fetch_html(session, p_url)
+    if not raw_html:
+        return rec
+
+    soup = BeautifulSoup(raw_html, "lxml")
+    bio, _ = parse_bio_and_name_from_lines(soup)
+
+    if not rec["raw_position"]:
+        raw_pos = bio.get("post") or bio.get("position") or bio.get("role") or ""
+        if raw_pos:
+            rec["raw_position"] = raw_pos
+            rec["position"] = normalize_position(raw_pos)
+
+    if rec["height_cm"] == 0:
+        h_raw = bio.get("výška") or bio.get("vyska") or bio.get("height") or ""
+        h_val = to_int(h_raw)
+        if 140 <= h_val <= 235:
+            rec["height_cm"] = h_val
+
+    if rec["birth_year"] == 0:
+        b_raw = bio.get("datum narození") or bio.get("ročník") or bio.get("birth date") or ""
+        ym = re.search(r"(19\d{2}|20[0-1]\d)", b_raw)
+        if ym:
+            rec["birth_year"] = int(ym.group(1))
+            rec["age"] = datetime.now().year - rec["birth_year"]
+
+    nat = bio.get("státní příslušnost") or bio.get("nationality") or ""
+    if nat:
+        rec["nationality"] = nat
+
+    return rec
+
+
+def get_table_context_title(table):
+    prev = table.find_previous(["h1", "h2", "h3", "h4", "caption"])
+    return normalize_header(prev.get_text()) if prev else ""
+
+
+def parse_cvf_table(table, league, page_url):
+    base = league["base_url"].rstrip("/")
+    rows = table.find_all("tr")
+    if len(rows) < 3:
+        return []
+
+    ctx_title = get_table_context_title(table)
+
+    header_row_idx = None
+    headers = []
+    for r_i, tr in enumerate(rows[:4]):
+        h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
+        joined = " ".join(h_cells)
+        if any(k in joined for k in ["hráč", "hrac", "příjmení", "prijmeni", "jméno", "jmeno", "player"]):
+            header_row_idx = r_i
+            headers = h_cells
+            break
+
+    if header_row_idx is None:
+        return []
+
+    group_map = {}
+    if header_row_idx > 0:
+        col_cursor = 0
+        for cell in rows[0].find_all(["th", "td"]):
+            span = int(cell.get("colspan", 1))
+            g_txt = normalize_header(cell.get_text())
+            for offset in range(span):
+                group_map[col_cursor + offset] = g_txt
+            col_cursor += span
+
+    print(f"[DEBUG][CVF] Title='{ctx_title}' | Headers={headers}")
+
+    col_map = {h: i for i, h in enumerate(headers) if h}
+
+    i_name = find_col(col_map, ["hráč", "hrac", "player"])
+    i_surname = find_col(col_map, ["příjmení", "prijmeni", "surname"])
+    i_firstname = find_col(col_map, ["jméno", "jmeno", "name"])
+    i_team = find_col(col_map, ["družstvo", "druzstvo", "tým", "tym", "klub", "team"])
+    i_pos = find_col(col_map, ["post", "pozice", "role", "position"])
+    i_height = find_col(col_map, ["výška", "vyska", "height"])
+    i_birth = find_col(col_map, ["ročník", "rocnik", "nar.", "narození", "datum narození", "birth"])
+    i_matches = find_col(col_map, ["záp.", "zap.", "z", "utk.", "utkání", "matches"])
+    i_sets = find_col(col_map, ["sety", "s", "sets"])
+
+    # Determine if this table is a single-skill leaderboard table or a combined stats table
+    is_block_table = "blok" in ctx_title and not group_map
+    is_serve_table = ("podán" in ctx_title or "podan" in ctx_title or "esa" in ctx_title) and not group_map
+    is_attack_table = ("útok" in ctx_title or "utok" in ctx_title or "smeč" in ctx_title) and not group_map
+    is_rec_table = ("příj" in ctx_title or "prij" in ctx_title) and not group_map
+
+    i_pts = None if (is_block_table or is_serve_table or is_attack_table or is_rec_table) else find_col(
+        col_map, ["body", "b", "pts", "points", "celkem"]
+    )
+
+    i_aces = find_col(col_map, ["esa", "eso", "podání #", "podani #", "aces"])
+    i_s_tot = find_col(col_map, ["podání celk", "podani celk", "podání", "podani"])
+    i_s_err = find_col(col_map, ["podání =", "podani ="])
+
+    i_blk = find_col(col_map, ["bloky", "blok", "blok #", "blocks"])
+
+    i_atk_pts = find_col(col_map, ["útok #", "utok #", "útok body", "utok body"])
+    i_atk_tot = find_col(col_map, ["útok celk", "utok celk", "útok", "utok"])
+    i_atk_pct = find_col(col_map, ["útok %", "utok %", "úsp. útoku", "usp. utoku", "úsp.%", "usp.%"])
+
+    i_rec_tot = find_col(col_map, ["příjem celk", "prijem celk", "příjem", "prijem"])
+    i_rec_pct = find_col(col_map, ["příjem %", "prijem %", "poz. příjem", "poz. prijem", "poz.%"])
+    i_rec_perf = find_col(col_map, ["perf. příjem", "perf. prijem", "výb.%", "vyb.%"])
+
+    if is_block_table and i_blk is None:
+        i_blk = find_col(col_map, ["body", "b", "#", "celkem"])
+    if is_serve_table and i_aces is None:
+        i_aces = find_col(col_map, ["body", "b", "#"])
+    if is_attack_table:
+        if i_atk_pts is None:
+            i_atk_pts = find_col(col_map, ["body", "b", "#"])
+        if i_atk_pct is None:
+            i_atk_pct = find_col(col_map, ["%", "úsp%", "úsp.%"])
+    if is_rec_table and i_rec_pct is None:
+        i_rec_pct = find_col(col_map, ["%", "poz%", "poz.%"])
+
+    if group_map:
+        for idx, h in enumerate(headers):
+            grp = group_map.get(idx, "")
+            if any(k in grp for k in ["podán", "podan", "serv"]):
+                if h in ("#", "esa", "eso", "body", "b") and i_aces is None:
+                    i_aces = idx
+                elif h in ("celk", "celkem", "tot") and i_s_tot is None:
+                    i_s_tot = idx
+                elif h in ("=", "ch", "chyby") and i_s_err is None:
+                    i_s_err = idx
+            elif any(k in grp for k in ["příj", "prij", "recep"]):
+                if h in ("celk", "celkem", "tot") and i_rec_tot is None:
+                    i_rec_tot = idx
+                elif h in ("%", "poz%", "poz.%") and i_rec_pct is None:
+                    i_rec_pct = idx
+                elif h in ("#", "perf%", "výb%", "vyb.%") and i_rec_perf is None:
+                    i_rec_perf = idx
+            elif any(k in grp for k in ["útok", "utok", "att"]):
+                if h in ("#", "body", "b") and i_atk_pts is None:
+                    i_atk_pts = idx
+                elif h in ("celk", "celkem", "tot") and i_atk_tot is None:
+                    i_atk_tot = idx
+                elif h in ("%", "úsp%", "úsp.%") and i_atk_pct is None:
+                    i_atk_pct = idx
+            elif any(k in grp for k in ["blok", "block"]):
+                if h in ("#", "body", "b", "celk", "celkem") and i_blk is None:
+                    i_blk = idx
+
+    records = []
+    for tr in rows[header_row_idx + 1 :]:
+        cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
+        if len(cells) < 4:
+            continue
+
+        if i_surname is not None and i_firstname is not None:
+            p_name = f"{cell_val(cells, i_surname)} {cell_val(cells, i_firstname)}".strip()
+        elif i_name is not None:
+            p_name = cell_val(cells, i_name)
+        elif i_surname is not None:
+            p_name = cell_val(cells, i_surname)
+        else:
+            p_name = ""
+
+        if not p_name or p_name.lower() in ("celkem", "total", "hráč", "hrac", "příjmení", "prijmeni"):
+            continue
+
+        team_name = cell_val(cells, i_team)
+        link = tr.find("a", href=True)
+        p_url = urljoin(base + "/", link["href"]) if link else page_url
+        pl_id_match = re.search(r"(\d{2,})", p_url)
+        pl_id = pl_id_match.group(1) if pl_id_match else re.sub(r"\W+", "_", f"{p_name}_{team_name}".lower())
+
+        sets = to_int(cell_val(cells, i_sets))
+        pts = to_int(cell_val(cells, i_pts))
+        aces = to_int(cell_val(cells, i_aces))
+        blocks = to_int(cell_val(cells, i_blk))
+        h_cm = to_int(cell_val(cells, i_height))
+        if h_cm < 140 or h_cm > 235:
+            h_cm = 0
+
+        b_raw = cell_val(cells, i_birth)
+        ym = re.search(r"(19\d{2}|20[0-1]\d)", b_raw)
+        b_year = int(ym.group(1)) if ym else 0
+        age = (datetime.now().year - b_year) if b_year else 0
+        raw_pos = cell_val(cells, i_pos)
+
+        records.append({
+            "player_id": f"{league['country']}_{league['competition_id']}_{pl_id}",
+            "league": league["name"],
+            "country": league["country"],
+            "gender": league.get("gender", ""),
+            "name": p_name,
+            "team": team_name,
+            "position": normalize_position(raw_pos),
+            "raw_position": raw_pos,
+            "height_cm": h_cm,
+            "birth_year": b_year,
+            "age": age,
+            "nationality": "CZE",
+            "matches": to_int(cell_val(cells, i_matches)),
+            "sets": sets,
+            "points": pts,
+            "points_per_set": round(pts / sets, 2) if sets > 0 else 0.0,
+            "break_points": 0,
+            "won_lost": 0,
+            "serve_total": to_int(cell_val(cells, i_s_tot)),
+            "aces": aces,
+            "aces_per_set": round(aces / sets, 2) if sets > 0 else 0.0,
+            "serve_errors": to_int(cell_val(cells, i_s_err)),
+            "blocks": blocks,
+            "blocks_per_set": round(blocks / sets, 2) if sets > 0 else 0.0,
+            "attack_total": to_int(cell_val(cells, i_atk_tot)),
+            "attack_points": to_int(cell_val(cells, i_atk_pts)),
+            "attack_errors": 0,
+            "attack_blocked": 0,
+            "attack_pct": to_float(cell_val(cells, i_atk_pct)),
+            "attack_eff_pct": 0.0,
+            "reception_total": to_int(cell_val(cells, i_rec_tot)),
+            "reception_pos_pct": to_float(cell_val(cells, i_rec_pct)),
+            "reception_perf_pct": to_float(cell_val(cells, i_rec_perf)),
+            "profile_url": p_url,
+            "photo_url": "",
+        })
+
+    return records
+
+
+def merge_cvf_records(merged_map, new_records):
+    num_fields = [
+        "matches", "sets", "points", "serve_total", "aces", "serve_errors",
+        "blocks", "attack_total", "attack_points", "attack_pct",
+        "reception_total", "reception_pos_pct", "reception_perf_pct",
+        "height_cm", "birth_year", "age",
+    ]
+    for r in new_records:
+        key = r["player_id"]
+        if key not in merged_map:
+            merged_map[key] = r
+            continue
+        cur = merged_map[key]
+        for f in num_fields:
+            if r.get(f, 0) > cur.get(f, 0):
+                cur[f] = r[f]
+        if cur["position"] == "Unknown" and r["position"] != "Unknown":
+            cur["position"] = r["position"]
+            cur["raw_position"] = r["raw_position"]
+        if not cur["team"] and r["team"]:
+            cur["team"] = r["team"]
+        if "/hrac" in r.get("profile_url", "").lower():
+            cur["profile_url"] = r["profile_url"]
+
+        sets = cur["sets"]
+        cur["points_per_set"] = round(cur["points"] / sets, 2) if sets > 0 else 0.0
+        cur["aces_per_set"] = round(cur["aces"] / sets, 2) if sets > 0 else 0.0
+        cur["blocks_per_set"] = round(cur["blocks"] / sets, 2) if sets > 0 else 0.0
+
+
+def scrape_cvf_cz_league(browser, session, league):
+    """Dedicated scraper for Czech Volleyball Federation portal (dv.cvf.cz/statistika/zebricky/...)."""
     base = league["base_url"].rstrip("/")
     entry_url = league["url"]
-    records = []
+    merged_map = {}
 
     context = browser.new_context(
         viewport={"width": 1920, "height": 1080},
@@ -719,126 +978,57 @@ def scrape_cvf_cz_league(browser, league):
     page = context.new_page()
 
     try:
-        print(f"[{league['name']}] Opening {entry_url}")
-        page.goto(entry_url, wait_until="networkidle", timeout=45000)
-        soup = BeautifulSoup(page.content(), "lxml")
+        urls_to_visit = [entry_url]
+        visited = set()
 
-        # Discover player stats page links from navigation
-        candidate_urls = [
-            entry_url.replace("/utkani/", "/hraci/"),
-            entry_url.replace("/utkani/", "/statistika-hracu/"),
-        ]
-        for a in soup.find_all("a", href=True):
-            href = urljoin(base + "/", a["href"])
-            txt = clean_text(a.get_text()).lower()
-            if any(k in href.lower() or k in txt for k in ["hrac", "hráč", "player", "statist"]):
-                if "ex-m" in href.lower() and href not in candidate_urls:
-                    candidate_urls.append(href)
+        while urls_to_visit and len(visited) < 10:
+            s_url = urls_to_visit.pop(0)
+            if s_url in visited:
+                continue
+            visited.add(s_url)
 
-        print(f"[{league['name']}] Candidate player stats URLs: {candidate_urls[:6]}")
-
-        for s_url in candidate_urls[:6]:
+            print(f"[{league['name']}] Opening {s_url}")
             try:
-                page.goto(s_url, wait_until="networkidle", timeout=35000)
-            except Exception:
+                resp = page.goto(s_url, wait_until="networkidle", timeout=40000)
+                if resp and resp.status >= 400:
+                    continue
+            except Exception as exc:
+                print(f"[WARN] CVF navigation error on {s_url}: {exc}")
                 continue
 
+            # Expand DataTables page size if present
+            try:
+                for sel in page.locator("select[name*='length']").all():
+                    for opt_val in ["-1", "500", "250", "100"]:
+                        if sel.locator(f"option[value='{opt_val}']").count() > 0:
+                            sel.select_option(opt_val)
+                            page.wait_for_timeout(800)
+                            break
+            except Exception:
+                pass
+
             s_soup = BeautifulSoup(page.content(), "lxml")
+
+            # Discover any category sub-links under /zebricky/2026-27/ex-m/
+            if s_url == entry_url:
+                for a in s_soup.find_all("a", href=True):
+                    href = urljoin(base + "/", a["href"])
+                    if "/zebricky/2026-27/ex-m" in href.lower() and href not in visited and href not in urls_to_visit:
+                        urls_to_visit.append(href)
+
             for table in s_soup.find_all("table"):
-                rows = table.find_all("tr")
-                if len(rows) < 5:
-                    continue
-                headers = [normalize_header(c.get_text()) for c in rows[0].find_all(["th", "td"])]
-                joined = " ".join(headers)
-                if not any(k in joined for k in ["hráč", "hrac", "jméno", "jmeno", "player"]):
-                    continue
+                parsed = parse_cvf_table(table, league, s_url)
+                if parsed:
+                    merge_cvf_records(merged_map, parsed)
 
-                print(f"[DEBUG][CVF] Found table on {s_url} with headers: {headers}")
-                col_map = {h: i for i, h in enumerate(headers) if h}
+        records = list(merged_map.values())
+        print(f"[{league['name']}] Total merged Czech players: {len(records)}")
 
-                i_name = find_col(col_map, ["hráč", "hrac", "jméno", "jmeno", "player"])
-                i_team = find_col(col_map, ["družstvo", "druzstvo", "tým", "tym", "klub", "team"])
-                i_pos = find_col(col_map, ["post", "pozice", "role", "position"])
-                i_height = find_col(col_map, ["výška", "vyska", "height"])
-                i_birth = find_col(col_map, ["ročník", "rocnik", "nar.", "narození", "birth"])
-                i_matches = find_col(col_map, ["záp.", "zap.", "z", "utk.", "matches"])
-                i_sets = find_col(col_map, ["sety", "s", "sets"])
-                i_pts = find_col(col_map, ["body", "b", "pts", "points"])
-                i_aces = find_col(col_map, ["esa", "eso", "podání #", "podani #", "aces"])
-                i_blk = find_col(col_map, ["bloky", "blok", "b#", "blocks"])
-                i_atk_pts = find_col(col_map, ["útok #", "utok #", "útok body", "utok body"])
-                i_atk_pct = find_col(col_map, ["útok %", "utok %", "úsp. útoku", "usp. utoku"])
-                i_rec_pct = find_col(col_map, ["příjem %", "prijem %", "poz. příjem", "poz. prijem"])
+        if records:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(enrich_cvf_player_bio, session, r) for r in records]
+                records = [fut.result() for fut in as_completed(futures)]
 
-                for idx, tr in enumerate(rows[1:], start=1):
-                    cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-                    if len(cells) < 5:
-                        continue
-                    p_name = cell_val(cells, i_name)
-                    if not p_name or p_name.lower() in ("celkem", "total", "hráč"):
-                        continue
-
-                    link = tr.find("a", href=True)
-                    p_url = urljoin(base + "/", link["href"]) if link else s_url
-                    pl_id_match = re.search(r"(\d{3,})", p_url)
-                    pl_id = pl_id_match.group(1) if pl_id_match else str(idx)
-
-                    sets = to_int(cell_val(cells, i_sets))
-                    pts = to_int(cell_val(cells, i_pts))
-                    aces = to_int(cell_val(cells, i_aces))
-                    blocks = to_int(cell_val(cells, i_blk))
-                    h_cm = to_int(cell_val(cells, i_height))
-                    if h_cm < 140 or h_cm > 235:
-                        h_cm = 0
-                    b_raw = cell_val(cells, i_birth)
-                    ym = re.search(r"(19\d{2}|20[0-1]\d)", b_raw)
-                    b_year = int(ym.group(1)) if ym else 0
-                    age = (datetime.now().year - b_year) if b_year else 0
-                    raw_pos = cell_val(cells, i_pos)
-
-                    records.append({
-                        "player_id": f"{league['country']}_{league['competition_id']}_{pl_id}",
-                        "league": league["name"],
-                        "country": league["country"],
-                        "gender": league.get("gender", ""),
-                        "name": p_name,
-                        "team": cell_val(cells, i_team),
-                        "position": normalize_position(raw_pos),
-                        "raw_position": raw_pos,
-                        "height_cm": h_cm,
-                        "birth_year": b_year,
-                        "age": age,
-                        "nationality": "CZE",
-                        "matches": to_int(cell_val(cells, i_matches)),
-                        "sets": sets,
-                        "points": pts,
-                        "points_per_set": round(pts / sets, 2) if sets > 0 else 0.0,
-                        "break_points": 0,
-                        "won_lost": 0,
-                        "serve_total": 0,
-                        "aces": aces,
-                        "aces_per_set": round(aces / sets, 2) if sets > 0 else 0.0,
-                        "serve_errors": 0,
-                        "blocks": blocks,
-                        "blocks_per_set": round(blocks / sets, 2) if sets > 0 else 0.0,
-                        "attack_total": 0,
-                        "attack_points": to_int(cell_val(cells, i_atk_pts)),
-                        "attack_errors": 0,
-                        "attack_blocked": 0,
-                        "attack_pct": to_float(cell_val(cells, i_atk_pct)),
-                        "attack_eff_pct": 0.0,
-                        "reception_total": 0,
-                        "reception_pos_pct": to_float(cell_val(cells, i_rec_pct)),
-                        "reception_perf_pct": 0.0,
-                        "profile_url": p_url,
-                        "photo_url": "",
-                    })
-                if records:
-                    break
-            if records:
-                break
-
-        print(f"[{league['name']}] Scraped {len(records)} players from dv.cvf.cz")
     except Exception as exc:
         print(f"[WARN] CVF scraper error: {exc}")
     finally:
@@ -887,7 +1077,7 @@ def main():
                 l_type = league.get("type", "dataproject")
 
                 if l_type == "cvf_cz":
-                    cvf_records = scrape_cvf_cz_league(browser, league)
+                    cvf_records = scrape_cvf_cz_league(browser, session, league)
                     all_records.extend(cvf_records)
                     continue
 
