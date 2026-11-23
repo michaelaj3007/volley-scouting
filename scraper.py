@@ -22,34 +22,74 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9,ro;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 ROLE_MAP = {
+    # English / International
     "setter": "Setter",
-    "ridicator": "Setter",
-    "ridicător": "Setter",
-    "palleggiatore": "Setter",
-    "πασαδόρος": "Setter",
     "opposite": "Opposite",
     "universal": "Opposite",
-    "fals": "Opposite",
-    "opposto": "Opposite",
-    "διαγώνιος": "Opposite",
     "outside": "Outside Hitter",
     "wing": "Outside Hitter",
     "spiker": "Outside Hitter",
+    "receiver": "Outside Hitter",
+    "middle": "Middle Blocker",
+    "blocker": "Middle Blocker",
+    "libero": "Libero",
+    # Greek
+    "πασαδόρος": "Setter",
+    "διαγώνιος": "Opposite",
+    "ακραίος": "Outside Hitter",
+    "κεντρικός": "Middle Blocker",
+    "λίμπερο": "Libero",
+    # Romanian
+    "ridicator": "Setter",
+    "ridicător": "Setter",
+    "fals": "Opposite",
     "extremă": "Outside Hitter",
     "extrema": "Outside Hitter",
     "secund": "Outside Hitter",
-    "schiacciatore": "Outside Hitter",
-    "ακραίος": "Outside Hitter",
-    "middle": "Middle Blocker",
     "centru": "Middle Blocker",
+    # Italian
+    "palleggiatore": "Setter",
+    "opposto": "Opposite",
+    "schiacciatore": "Outside Hitter",
     "centrale": "Middle Blocker",
-    "κεντρικός": "Middle Blocker",
-    "libero": "Libero",
-    "λίμπερο": "Libero",
+    # Swedish
+    "passare": "Setter",
+    "högerspiker": "Opposite",
+    "vänsterspiker": "Outside Hitter",
+    "center": "Middle Blocker",
+    # Hungarian
+    "feladó": "Setter",
+    "átló": "Opposite",
+    "négyesütő": "Outside Hitter",
+    "szélső": "Outside Hitter",
+    "liberó": "Libero",
+    # Croatian
+    "dizač": "Setter",
+    "korektor": "Opposite",
+    "primač": "Outside Hitter",
+    "srednji": "Middle Blocker",
+    # Bulgarian
+    "разпределител": "Setter",
+    "диагонал": "Opposite",
+    "посрещач": "Outside Hitter",
+    "център": "Middle Blocker",
+    "либеро": "Libero",
+    # Finnish
+    "passari": "Setter",
+    "hakkuri": "Opposite",
+    "yleispelaaja": "Outside Hitter",
+    "keskitorjuja": "Middle Blocker",
+    # Czech & Slovak
+    "nahrávač": "Setter",
+    "univerzál": "Opposite",
+    "smečař": "Outside Hitter",
+    "smečiar": "Outside Hitter",
+    "blokař": "Middle Blocker",
+    "blokár": "Middle Blocker",
 }
 
 KNOWN_BIO_LABELS = {
@@ -62,11 +102,15 @@ KNOWN_BIO_LABELS = {
     "height",
     "înălțime",
     "inaltime",
+    "ύψος",
+    "výška",
     "date of birth",
     "birth date",
     "birth place",
+    "ημ. γέννησης",
     "sport nationality",
     "nationality",
+    "εθνικότητα",
     "reach",
     "jump",
     "spike",
@@ -155,6 +199,30 @@ def cell_val(cells, idx, default=""):
     return default
 
 
+def resolve_dataproject_stats_urls(session, league):
+    """Builds candidate Statistics_AllPlayers.aspx URLs, auto-discovering PID from CompetitionHome if needed."""
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
+    pid = str(league.get("pid", "")).strip()
+
+    urls = []
+    if pid:
+        urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}")
+    urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}")
+
+    if not pid:
+        home_html = html.unescape(fetch_html(session, f"{base}/CompetitionHome.aspx?ID={cid}"))
+        if home_html:
+            for m in re.findall(r"Statistics(?:_AllPlayers)?\.aspx\?[^\"'<>\s)]+", home_html, re.IGNORECASE):
+                found_pid = extract_query_param(urljoin(base + "/", m), "PID")
+                if found_pid:
+                    cand = f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={found_pid}"
+                    if cand not in urls:
+                        urls.insert(0, cand)
+                    break
+    return urls
+
+
 def parse_radgrid_page(soup, league):
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
@@ -173,14 +241,14 @@ def parse_radgrid_page(soup, league):
         return {}, 0
 
     i_pid = find_col(headers, ["playerid", "player id", "id"])
-    i_player = find_col(headers, ["player", "jucător", "jucator"])
+    i_player = find_col(headers, ["player", "jucător", "jucator", "igrac", "igrač", "hráč", "играч", "παίκτης"])
     i_surname = find_col(headers, ["surname", "last name"])
     i_name = find_col(headers, ["name", "first name"])
-    i_team = find_col(headers, ["team", "echipa", "club"])
+    i_team = find_col(headers, ["team", "echipa", "club", "klub", "družstvo", "tým", "отбор", "ομάδα"])
     i_country = find_col(headers, ["country", "nation", "nat"])
-    i_matches = find_col(headers, ["matches", "meciuri", "played", "m"])
+    i_matches = find_col(headers, ["matches", "meciuri", "played", "m", "z"])
     i_sets = find_col(headers, ["sets", "seturi", "s"])
-    i_points = find_col(headers, ["points", "puncte", "pts", "tot"])
+    i_points = find_col(headers, ["points", "puncte", "pts", "tot", "b"])
     i_bp = find_col(headers, ["bp", "break points"])
     i_wl = find_col(headers, ["w-p", "w-l", "wl"])
 
@@ -312,33 +380,22 @@ def parse_radgrid_page(soup, league):
     return page_players, len(headers)
 
 
-def scrape_all_players_playwright(league):
-    if not HAS_PLAYWRIGHT:
-        print("[WARN] Playwright not installed; skipping JS stats table.")
-        return {}
-
-    base = league["base_url"].rstrip("/")
-    cid = str(league["competition_id"])
-    pid = str(league.get("pid", ""))
-    url = (
-        f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}"
-        if pid
-        else f"{base}/Statistics_AllPlayers.aspx?ID={cid}"
-    )
-
+def scrape_all_players_playwright(browser, league, candidate_urls):
     all_players = {}
+    context = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=HEADERS["User-Agent"],
+    )
+    page = context.new_page()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=HEADERS["User-Agent"],
-        )
-        page = context.new_page()
-
-        try:
+    try:
+        for url in candidate_urls:
             print(f"[{league['name']}] Opening browser on {url}")
-            page.goto(url, wait_until="networkidle", timeout=45000)
+            try:
+                page.goto(url, wait_until="networkidle", timeout=45000)
+            except Exception as exc:
+                print(f"[WARN] Navigation error on {url}: {exc}")
+                continue
 
             try:
                 page.wait_for_function(
@@ -349,15 +406,16 @@ def scrape_all_players_playwright(league):
                         }
                         return false;
                     }""",
-                    timeout=20000,
+                    timeout=18000,
                 )
             except Exception:
-                print(f"[WARN] Timed out waiting for populated RadGrid rows on {url}")
+                print(f"[WARN] No populated RadGrid rows on {url}")
+                continue
 
             prev_sig = None
             for page_num in range(1, 60):
                 soup = BeautifulSoup(page.content(), "lxml")
-                batch, ncols = parse_radgrid_page(soup, league)
+                batch, _ = parse_radgrid_page(soup, league)
                 if not batch:
                     break
 
@@ -372,8 +430,6 @@ def scrape_all_players_playwright(league):
                         new_count += 1
                     all_players[pl_id] = rec
 
-                print(f"[{league['name']}] Page {page_num}: +{new_count} players (total {len(all_players)})")
-
                 if new_count == 0:
                     break
 
@@ -381,7 +437,6 @@ def scrape_all_players_playwright(league):
                     "() => { const r = document.querySelector('tr.rgRow'); return r ? (r.textContent || '').trim() : ''; }"
                 )
 
-                # Method 1: Use Telerik RadGrid JS API directly
                 advanced_via_api = page.evaluate(
                     """() => {
                         if (typeof $find !== 'function') return 'no_find';
@@ -406,7 +461,6 @@ def scrape_all_players_playwright(league):
                     break
 
                 if advanced_via_api != "paged":
-                    # Method 2: Click the Next Page button directly (without blocking on 'return false')
                     next_btn = page.locator(
                         "input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page']"
                     ).first
@@ -433,11 +487,11 @@ def scrape_all_players_playwright(league):
                 except Exception:
                     break
 
-            print(f"[{league['name']}] Browser scraped {len(all_players)} players with full stats.")
-        except Exception as exc:
-            print(f"[WARN] Playwright error on {url}: {exc}")
-        finally:
-            browser.close()
+            if all_players:
+                print(f"[{league['name']}] Browser scraped {len(all_players)} players with full stats.")
+                break
+    finally:
+        context.close()
 
     return all_players
 
@@ -445,9 +499,10 @@ def scrape_all_players_playwright(league):
 def discover_extra_players_from_teams(session, league, existing_players):
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
-    pid = str(league.get("pid", ""))
+    pid = str(league.get("pid", "")).strip()
 
     seed_urls = [
+        f"{base}/CompetitionHome.aspx?ID={cid}",
         f"{base}/CompetitionTeamSearch.aspx?ID={cid}",
         f"{base}/CompetitionPlayerSearch.aspx?ID={cid}",
     ]
@@ -527,7 +582,7 @@ def parse_bio_and_name_from_lines(soup):
 
     for i, line in enumerate(lines):
         low = line.rstrip(":").lower()
-        if low == "shirt number" and i > 0 and not name_guess:
+        if low in ("shirt number", "número", "αριθμός") and i > 0 and not name_guess:
             for back in range(1, min(4, i + 1)):
                 cand = re.sub(r"^\d+\s+", "", lines[i - back]).strip()
                 c_low = cand.lower()
@@ -586,20 +641,22 @@ def enrich_player_profile(league, pl_id, data):
             or bio.get("height")
             or bio.get("înălțime")
             or bio.get("inaltime")
+            or bio.get("ύψος")
+            or bio.get("výška")
             or ""
         )
         h_val = to_int(raw_height)
         if 140 <= h_val <= 235:
             height_cm = h_val
 
-        raw_birth = bio.get("date of birth") or bio.get("birth date") or ""
+        raw_birth = bio.get("date of birth") or bio.get("birth date") or bio.get("ημ. γέννησης") or ""
         ym = re.search(r"(19\d{2}|20[0-1]\d)", raw_birth)
         if ym:
             birth_year = int(ym.group(1))
             age = datetime.now().year - birth_year
 
         if not nationality:
-            nationality = bio.get("sport nationality") or bio.get("nationality") or ""
+            nationality = bio.get("sport nationality") or bio.get("nationality") or bio.get("εθνικότητα") or ""
 
         img = soup.find("img", id=re.compile(r"player|photo|img", re.IGNORECASE))
         if img and img.get("src"):
@@ -649,6 +706,147 @@ def enrich_player_profile(league, pl_id, data):
     }
 
 
+def scrape_cvf_cz_league(browser, league):
+    """Dedicated scraper for Czech Volleyball Federation portal (dv.cvf.cz)."""
+    base = league["base_url"].rstrip("/")
+    entry_url = league["url"]
+    records = []
+
+    context = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=HEADERS["User-Agent"],
+    )
+    page = context.new_page()
+
+    try:
+        print(f"[{league['name']}] Opening {entry_url}")
+        page.goto(entry_url, wait_until="networkidle", timeout=45000)
+        soup = BeautifulSoup(page.content(), "lxml")
+
+        # Discover player stats page links from navigation
+        candidate_urls = [
+            entry_url.replace("/utkani/", "/hraci/"),
+            entry_url.replace("/utkani/", "/statistika-hracu/"),
+        ]
+        for a in soup.find_all("a", href=True):
+            href = urljoin(base + "/", a["href"])
+            txt = clean_text(a.get_text()).lower()
+            if any(k in href.lower() or k in txt for k in ["hrac", "hráč", "player", "statist"]):
+                if "ex-m" in href.lower() and href not in candidate_urls:
+                    candidate_urls.append(href)
+
+        print(f"[{league['name']}] Candidate player stats URLs: {candidate_urls[:6]}")
+
+        for s_url in candidate_urls[:6]:
+            try:
+                page.goto(s_url, wait_until="networkidle", timeout=35000)
+            except Exception:
+                continue
+
+            s_soup = BeautifulSoup(page.content(), "lxml")
+            for table in s_soup.find_all("table"):
+                rows = table.find_all("tr")
+                if len(rows) < 5:
+                    continue
+                headers = [normalize_header(c.get_text()) for c in rows[0].find_all(["th", "td"])]
+                joined = " ".join(headers)
+                if not any(k in joined for k in ["hráč", "hrac", "jméno", "jmeno", "player"]):
+                    continue
+
+                print(f"[DEBUG][CVF] Found table on {s_url} with headers: {headers}")
+                col_map = {h: i for i, h in enumerate(headers) if h}
+
+                i_name = find_col(col_map, ["hráč", "hrac", "jméno", "jmeno", "player"])
+                i_team = find_col(col_map, ["družstvo", "druzstvo", "tým", "tym", "klub", "team"])
+                i_pos = find_col(col_map, ["post", "pozice", "role", "position"])
+                i_height = find_col(col_map, ["výška", "vyska", "height"])
+                i_birth = find_col(col_map, ["ročník", "rocnik", "nar.", "narození", "birth"])
+                i_matches = find_col(col_map, ["záp.", "zap.", "z", "utk.", "matches"])
+                i_sets = find_col(col_map, ["sety", "s", "sets"])
+                i_pts = find_col(col_map, ["body", "b", "pts", "points"])
+                i_aces = find_col(col_map, ["esa", "eso", "podání #", "podani #", "aces"])
+                i_blk = find_col(col_map, ["bloky", "blok", "b#", "blocks"])
+                i_atk_pts = find_col(col_map, ["útok #", "utok #", "útok body", "utok body"])
+                i_atk_pct = find_col(col_map, ["útok %", "utok %", "úsp. útoku", "usp. utoku"])
+                i_rec_pct = find_col(col_map, ["příjem %", "prijem %", "poz. příjem", "poz. prijem"])
+
+                for idx, tr in enumerate(rows[1:], start=1):
+                    cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
+                    if len(cells) < 5:
+                        continue
+                    p_name = cell_val(cells, i_name)
+                    if not p_name or p_name.lower() in ("celkem", "total", "hráč"):
+                        continue
+
+                    link = tr.find("a", href=True)
+                    p_url = urljoin(base + "/", link["href"]) if link else s_url
+                    pl_id_match = re.search(r"(\d{3,})", p_url)
+                    pl_id = pl_id_match.group(1) if pl_id_match else str(idx)
+
+                    sets = to_int(cell_val(cells, i_sets))
+                    pts = to_int(cell_val(cells, i_pts))
+                    aces = to_int(cell_val(cells, i_aces))
+                    blocks = to_int(cell_val(cells, i_blk))
+                    h_cm = to_int(cell_val(cells, i_height))
+                    if h_cm < 140 or h_cm > 235:
+                        h_cm = 0
+                    b_raw = cell_val(cells, i_birth)
+                    ym = re.search(r"(19\d{2}|20[0-1]\d)", b_raw)
+                    b_year = int(ym.group(1)) if ym else 0
+                    age = (datetime.now().year - b_year) if b_year else 0
+                    raw_pos = cell_val(cells, i_pos)
+
+                    records.append({
+                        "player_id": f"{league['country']}_{league['competition_id']}_{pl_id}",
+                        "league": league["name"],
+                        "country": league["country"],
+                        "gender": league.get("gender", ""),
+                        "name": p_name,
+                        "team": cell_val(cells, i_team),
+                        "position": normalize_position(raw_pos),
+                        "raw_position": raw_pos,
+                        "height_cm": h_cm,
+                        "birth_year": b_year,
+                        "age": age,
+                        "nationality": "CZE",
+                        "matches": to_int(cell_val(cells, i_matches)),
+                        "sets": sets,
+                        "points": pts,
+                        "points_per_set": round(pts / sets, 2) if sets > 0 else 0.0,
+                        "break_points": 0,
+                        "won_lost": 0,
+                        "serve_total": 0,
+                        "aces": aces,
+                        "aces_per_set": round(aces / sets, 2) if sets > 0 else 0.0,
+                        "serve_errors": 0,
+                        "blocks": blocks,
+                        "blocks_per_set": round(blocks / sets, 2) if sets > 0 else 0.0,
+                        "attack_total": 0,
+                        "attack_points": to_int(cell_val(cells, i_atk_pts)),
+                        "attack_errors": 0,
+                        "attack_blocked": 0,
+                        "attack_pct": to_float(cell_val(cells, i_atk_pct)),
+                        "attack_eff_pct": 0.0,
+                        "reception_total": 0,
+                        "reception_pos_pct": to_float(cell_val(cells, i_rec_pct)),
+                        "reception_perf_pct": 0.0,
+                        "profile_url": p_url,
+                        "photo_url": "",
+                    })
+                if records:
+                    break
+            if records:
+                break
+
+        print(f"[{league['name']}] Scraped {len(records)} players from dv.cvf.cz")
+    except Exception as exc:
+        print(f"[WARN] CVF scraper error: {exc}")
+    finally:
+        context.close()
+
+    return records
+
+
 def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
     if not os.path.exists(overrides_path) or df.empty:
         return df
@@ -661,8 +859,8 @@ def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
             pid = row["player_id"]
             if pid in ov_map:
                 h = ov_map[pid].get("height_cm", 0)
-                if pd.notna(h) and int(h) > 0:
-                    df.at[idx, "height_cm"] = int(h)
+                if pd.notna(h) and int(float(h)) > 0:
+                    df.at[idx, "height_cm"] = int(float(h))
                 pos = ov_map[pid].get("position", "")
                 if pd.notna(pos) and str(pos).strip():
                     df.at[idx, "position"] = str(pos).strip()
@@ -678,25 +876,42 @@ def main():
     all_records = []
     session = get_session()
 
-    for league in leagues:
-        print(f"=== Processing {league['name']} ===")
-        players = scrape_all_players_playwright(league)
-        players = discover_extra_players_from_teams(session, league, players)
+    if not HAS_PLAYWRIGHT:
+        raise RuntimeError("Playwright is required to scrape JavaScript tables.")
 
-        items = list(players.items())
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {
-                executor.submit(enrich_player_profile, league, pl_id, pdata): pl_id
-                for pl_id, pdata in items
-            }
-            for fut in as_completed(futures):
-                rec = fut.result()
-                if rec:
-                    all_records.append(rec)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            for league in leagues:
+                print(f"=== Processing {league['name']} ===")
+                l_type = league.get("type", "dataproject")
+
+                if l_type == "cvf_cz":
+                    cvf_records = scrape_cvf_cz_league(browser, league)
+                    all_records.extend(cvf_records)
+                    continue
+
+                cand_urls = resolve_dataproject_stats_urls(session, league)
+                players = scrape_all_players_playwright(browser, league, cand_urls)
+                players = discover_extra_players_from_teams(session, league, players)
+
+                items = list(players.items())
+                with ThreadPoolExecutor(max_workers=12) as executor:
+                    futures = {
+                        executor.submit(enrich_player_profile, league, pl_id, pdata): pl_id
+                        for pl_id, pdata in items
+                    }
+                    for fut in as_completed(futures):
+                        rec = fut.result()
+                        if rec:
+                            all_records.append(rec)
+        finally:
+            browser.close()
 
     os.makedirs("data", exist_ok=True)
     df = pd.DataFrame(all_records)
     if not df.empty:
+        df = df.drop_duplicates(subset=["player_id"], keep="first")
         df = apply_manual_overrides(df)
         df = df.sort_values(by=["points", "name"], ascending=[False, True])
 
@@ -710,7 +925,7 @@ def main():
     with open("data/last_updated.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"=== DONE: Saved {len(df)} players to data/players.csv ===")
+    print(f"=== DONE: Saved {len(df)} players across {len(leagues)} leagues to data/players.csv ===")
 
 
 if __name__ == "__main__":
