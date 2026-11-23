@@ -156,7 +156,6 @@ def cell_val(cells, idx, default=""):
 
 
 def parse_radgrid_page(soup, league):
-    """Parses one rendered page of Statistics_AllPlayers.aspx and returns (players_dict, headers_len)."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
 
@@ -185,7 +184,6 @@ def parse_radgrid_page(soup, league):
     i_bp = find_col(headers, ["bp", "break points"])
     i_wl = find_col(headers, ["w-p", "w-l", "wl"])
 
-    # Serve
     i_s_err = find_col(headers, ["s =", "s=", "s err"])
     i_s_ok = find_col(headers, ["s !", "s!"])
     i_s_slash = find_col(headers, ["s /", "s/"])
@@ -193,7 +191,6 @@ def parse_radgrid_page(soup, league):
     i_s_pos = find_col(headers, ["s +", "s+"])
     i_s_ace = find_col(headers, ["s #", "s#", "s pts", "aces", "ace"])
 
-    # Reception
     i_r_err = find_col(headers, ["r =", "r=", "r err"])
     i_r_ok = find_col(headers, ["r !", "r!"])
     i_r_slash = find_col(headers, ["r /", "r/"])
@@ -201,7 +198,6 @@ def parse_radgrid_page(soup, league):
     i_r_pos = find_col(headers, ["r +", "r+"])
     i_r_perf = find_col(headers, ["r #", "r#"])
 
-    # Attack
     i_a_err = find_col(headers, ["a =", "a=", "a err"])
     i_a_ok = find_col(headers, ["a !", "a!"])
     i_a_blk = find_col(headers, ["a /", "a/", "a blk"])
@@ -209,11 +205,9 @@ def parse_radgrid_page(soup, league):
     i_a_pos = find_col(headers, ["a +", "a+"])
     i_a_pts = find_col(headers, ["a #", "a#", "a pts", "atk pts"])
 
-    # Block
     i_b_err = find_col(headers, ["b =", "b="])
     i_b_pts = find_col(headers, ["b #", "b#", "b pts", "blk", "blocks", "block"])
 
-    # Percentages scoped strictly between sections so Reception exc.% and Attack exc.% never collide
     r_start = i_r_perf if i_r_perf is not None else 0
     r_end = i_a_err if i_a_err is not None else len(headers)
     i_r_pos_pct = find_col(headers, ["pos%", "r pos%", "rec pos%"], r_start, r_end)
@@ -253,7 +247,6 @@ def parse_radgrid_page(soup, league):
         bp = to_int(cell_val(cells, i_bp))
         wl = to_int(cell_val(cells, i_wl))
 
-        # Serve
         s_err = to_int(cell_val(cells, i_s_err))
         s_ok = to_int(cell_val(cells, i_s_ok))
         s_slash = to_int(cell_val(cells, i_s_slash))
@@ -262,7 +255,6 @@ def parse_radgrid_page(soup, league):
         aces = to_int(cell_val(cells, i_s_ace))
         s_tot = s_err + s_ok + s_slash + s_neg + s_pos + aces
 
-        # Reception
         r_err = to_int(cell_val(cells, i_r_err))
         r_ok = to_int(cell_val(cells, i_r_ok))
         r_slash = to_int(cell_val(cells, i_r_slash))
@@ -277,7 +269,6 @@ def parse_radgrid_page(soup, league):
         if rec_perf_pct == 0.0 and r_tot > 0:
             rec_perf_pct = round(100.0 * r_perf / r_tot, 1)
 
-        # Attack
         a_err = to_int(cell_val(cells, i_a_err))
         a_ok = to_int(cell_val(cells, i_a_ok))
         a_blk = to_int(cell_val(cells, i_a_blk))
@@ -290,7 +281,6 @@ def parse_radgrid_page(soup, league):
             atk_pct = round(100.0 * a_pts / a_tot, 1)
         atk_eff_pct = round(100.0 * (a_pts - a_err - a_blk) / a_tot, 1) if a_tot > 0 else 0.0
 
-        # Block
         blocks = to_int(cell_val(cells, i_b_pts))
 
         page_players[pl_id] = {
@@ -323,7 +313,6 @@ def parse_radgrid_page(soup, league):
 
 
 def scrape_all_players_playwright(league):
-    """Uses headless Chromium to render the JS Telerik RadGrid and paginate through all players."""
     if not HAS_PLAYWRIGHT:
         print("[WARN] Playwright not installed; skipping JS stats table.")
         return {}
@@ -365,14 +354,11 @@ def scrape_all_players_playwright(league):
             except Exception:
                 print(f"[WARN] Timed out waiting for populated RadGrid rows on {url}")
 
-            # Try to maximize rows per page via Telerik client API if supported, otherwise paginate
             prev_sig = None
-            for page_num in range(1, 50):
+            for page_num in range(1, 60):
                 soup = BeautifulSoup(page.content(), "lxml")
                 batch, ncols = parse_radgrid_page(soup, league)
                 if not batch:
-                    if page_num == 1:
-                        print(f"[DEBUG] Page 1 had 0 parsed players (ncols={ncols}).")
                     break
 
                 curr_sig = tuple(list(batch.keys())[:3])
@@ -386,36 +372,54 @@ def scrape_all_players_playwright(league):
                         new_count += 1
                     all_players[pl_id] = rec
 
-                if page_num == 1:
-                    sample_rec = next(iter(batch.values()))
-                    print(
-                        f"[DEBUG] Page 1 sample: {sample_rec['name']} ({sample_rec['team']}) "
-                        f"Sets={sample_rec['sets']} Pts={sample_rec['points']} "
-                        f"Aces={sample_rec['aces']} Blk={sample_rec['blocks']} Atk%={sample_rec['attack_pct']}"
-                    )
+                print(f"[{league['name']}] Page {page_num}: +{new_count} players (total {len(all_players)})")
 
                 if new_count == 0:
                     break
 
-                # Click Next Page button
                 prev_first_text = page.evaluate(
                     "() => { const r = document.querySelector('tr.rgRow'); return r ? (r.textContent || '').trim() : ''; }"
                 )
 
-                next_btn = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext").first
-                if next_btn.count() == 0:
-                    break
-
-                is_disabled = next_btn.evaluate(
-                    """el => {
-                        const oc = (el.getAttribute('onclick') || '').toLowerCase();
-                        return el.disabled || el.classList.contains('rgDisabled') || oc.includes('return false');
+                # Method 1: Use Telerik RadGrid JS API directly
+                advanced_via_api = page.evaluate(
+                    """() => {
+                        if (typeof $find !== 'function') return 'no_find';
+                        const grids = document.querySelectorAll('.RadGrid');
+                        for (const g of grids) {
+                            if (!g.id) continue;
+                            const ctrl = $find(g.id);
+                            if (ctrl && typeof ctrl.get_masterTableView === 'function') {
+                                const mtv = ctrl.get_masterTableView();
+                                const idx = mtv.get_currentPageIndex();
+                                const total = mtv.get_pageCount();
+                                if (total > 0 && idx >= total - 1) return 'last_page';
+                                mtv.page('Next');
+                                return 'paged';
+                            }
+                        }
+                        return 'no_grid';
                     }"""
                 )
-                if is_disabled:
+
+                if advanced_via_api == "last_page":
                     break
 
-                next_btn.click(force=True)
+                if advanced_via_api != "paged":
+                    # Method 2: Click the Next Page button directly (without blocking on 'return false')
+                    next_btn = page.locator(
+                        "input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page']"
+                    ).first
+                    if next_btn.count() == 0:
+                        break
+                    is_disabled = next_btn.evaluate(
+                        "el => Boolean(el.disabled || el.classList.contains('rgDisabled'))"
+                    )
+                    if is_disabled:
+                        break
+                    next_btn.scroll_into_view_if_needed()
+                    next_btn.click(force=True)
+
                 try:
                     page.wait_for_function(
                         """(prevText) => {
@@ -424,7 +428,7 @@ def scrape_all_players_playwright(league):
                             return cur.length > 10 && cur !== prevText;
                         }""",
                         arg=prev_first_text,
-                        timeout=10000,
+                        timeout=12000,
                     )
                 except Exception:
                     break
@@ -439,7 +443,6 @@ def scrape_all_players_playwright(league):
 
 
 def discover_extra_players_from_teams(session, league, existing_players):
-    """Scans team rosters so we get TeamID URLs and catch players with 0 sets played."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", ""))
@@ -564,7 +567,6 @@ def enrich_player_profile(league, pl_id, data):
         bio, name_guess = parse_bio_and_name_from_lines(soup)
 
         if not name:
-            # Try explicit Data Project player name spans first, then line before Shirt Number
             el_sur = soup.find(id=re.compile(r"LBL_Surname|PlayerSurname", re.IGNORECASE))
             el_nam = soup.find(id=re.compile(r"LBL_Name|PlayerName", re.IGNORECASE))
             if el_sur or el_nam:
@@ -648,7 +650,6 @@ def enrich_player_profile(league, pl_id, data):
 
 
 def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
-    """Keeps any manual heights/positions you add so daily updates never erase them."""
     if not os.path.exists(overrides_path) or df.empty:
         return df
     try:
