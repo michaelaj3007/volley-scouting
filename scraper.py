@@ -46,6 +46,31 @@ ROLE_MAP = {
     "λίμπερο": "Libero",
 }
 
+KNOWN_BIO_LABELS = {
+    "shirt number",
+    "club",
+    "team",
+    "position",
+    "role",
+    "heigth",
+    "height",
+    "înălțime",
+    "inaltime",
+    "date of birth",
+    "birth date",
+    "birth place",
+    "sport nationality",
+    "nationality",
+    "reach",
+    "jump",
+    "spike",
+    "block",
+    "history",
+    "period",
+    "notes",
+    "statistics",
+}
+
 
 def get_session():
     s = requests.Session()
@@ -130,6 +155,26 @@ def cell_val(cells, idx, default=""):
     return default
 
 
+def find_all_players_grid_rows(soup, header_table, header_row_idx):
+    """Handles Telerik RadGrid where headers (rgHeaderDiv) and data (rgDataDiv) are in separate tables."""
+    grid = header_table.find_parent(class_=re.compile(r"RadGrid", re.IGNORECASE))
+    if grid:
+        rg_rows = grid.select("tr.rgRow, tr.rgAltRow")
+        if rg_rows:
+            return rg_rows
+        data_div = grid.find(class_=re.compile(r"rgDataDiv", re.IGNORECASE))
+        if data_div:
+            rows = data_div.find_all("tr")
+            if rows:
+                return rows
+
+    global_rg_rows = soup.select("tr.rgRow, tr.rgAltRow")
+    if global_rg_rows:
+        return global_rg_rows
+
+    return header_table.find_all("tr")[header_row_idx + 1 :]
+
+
 def scrape_all_players_table(session, league):
     """Reads the complete Data Project Statistics_AllPlayers.aspx master table."""
     base = league["base_url"].rstrip("/")
@@ -155,9 +200,9 @@ def scrape_all_players_table(session, league):
 
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
-            if len(rows) < 2:
+            if not rows:
                 continue
-            for r_i, tr in enumerate(rows[:4]):
+            for r_i, tr in enumerate(rows[:5]):
                 h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
                 if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
                     target_table = table
@@ -171,6 +216,9 @@ def scrape_all_players_table(session, league):
             continue
 
         print(f"[DEBUG] AllPlayers FULL headers ({len(headers)} cols): {headers}")
+
+        data_rows = find_all_players_grid_rows(soup, target_table, header_row_idx)
+        print(f"[DEBUG] AllPlayers data_rows found: {len(data_rows)}")
 
         col_map = {}
         for i, h in enumerate(headers):
@@ -189,7 +237,7 @@ def scrape_all_players_table(session, league):
         i_bp = find_col(col_map, ["bp", "break points"])
         i_wl = find_col(col_map, ["w-p", "w-l", "wl"])
 
-        # Serve columns (DataVolley notation: s =, s !, s /, s -, s +, s #, s tot)
+        # Serve columns
         i_s_err = find_col(col_map, ["s =", "s=", "s err", "srv err"])
         i_s_ok = find_col(col_map, ["s !", "s!"])
         i_s_slash = find_col(col_map, ["s /", "s/"])
@@ -198,7 +246,7 @@ def scrape_all_players_table(session, league):
         i_s_ace = find_col(col_map, ["s #", "s#", "s pts", "aces", "ace", "srv pts"])
         i_s_tot = find_col(col_map, ["s tot", "stot", "srv tot"])
 
-        # Reception columns (r =, r /, r -, r !, r +, r #, r tot)
+        # Reception columns
         i_r_err = find_col(col_map, ["r =", "r=", "r err"])
         i_r_slash = find_col(col_map, ["r /", "r/"])
         i_r_neg = find_col(col_map, ["r -", "r-"])
@@ -209,7 +257,7 @@ def scrape_all_players_table(session, league):
         i_r_pos_pct = find_col(col_map, ["r pos%", "pos%", "rec pos%", "r %"])
         i_r_perf_pct = find_col(col_map, ["r perf%", "r exc%", "perf%", "exc%"])
 
-        # Attack columns (a =, a /, a -, a !, a +, a #, a tot, a %)
+        # Attack columns
         i_a_err = find_col(col_map, ["a =", "a=", "a err"])
         i_a_blk = find_col(col_map, ["a /", "a/", "a blk"])
         i_a_neg = find_col(col_map, ["a -", "a-"])
@@ -219,16 +267,19 @@ def scrape_all_players_table(session, league):
         i_a_tot = find_col(col_map, ["a tot", "atot", "atk tot"])
         i_a_pct = find_col(col_map, ["a %", "a%", "a exc%", "atk %", "attack %"])
 
-        # Block columns (b =, b /, b -, b !, b +, b #, b pts)
+        # Block columns
         i_b_pts = find_col(col_map, ["b #", "b#", "b pts", "blk", "blocks", "block", "bl"])
 
-        data_rows = target_table.find_all("tr")[header_row_idx + 1 :]
         sample_printed = False
 
         for tr in data_rows:
             cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-            if len(cells) < max(5, len(headers) // 2):
+            if len(cells) < 5:
                 continue
+
+            if not sample_printed:
+                print(f"[DEBUG] Sample AllPlayers row ({len(cells)} cells): {cells[:25]}")
+                sample_printed = True
 
             pl_id = re.sub(r"[^0-9]", "", cell_val(cells, i_pid))
             if not pl_id:
@@ -238,13 +289,9 @@ def scrape_all_players_table(session, league):
             if not pl_id:
                 continue
 
-            if not sample_printed:
-                print(f"[DEBUG] Sample AllPlayers row: {cells[:25]}")
-                sample_printed = True
-
             first_n = cell_val(cells, i_name)
             last_n = cell_val(cells, i_surname)
-            full_name = f"{first_n} {last_n}".strip() if (first_n or last_n) else cell_val(cells, i_player)
+            full_name = f"{last_n} {first_n}".strip() if (first_n or last_n) else cell_val(cells, i_player)
 
             matches = to_int(cell_val(cells, i_matches))
             sets = to_int(cell_val(cells, i_sets))
@@ -332,7 +379,7 @@ def scrape_all_players_table(session, league):
 
 
 def discover_extra_players_from_teams(session, league, existing_players):
-    """Also scans team rosters (including onclick JS) to catch players with 0 sets played."""
+    """Scans team rosters so we get TeamID URLs and players with 0 sets played."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", ""))
@@ -345,30 +392,42 @@ def discover_extra_players_from_teams(session, league, existing_players):
         seed_urls.append(f"{base}/CompetitionStandings.aspx?ID={cid}&PID={pid}")
 
     team_urls = set()
-    found_ids = set()
+    player_urls = {}  # pl_id -> best PlayerDetails URL (preferring ones with TeamID)
+
+    def register_links(raw_html):
+        text = html.unescape(raw_html)
+        for m in re.findall(r"CompetitionTeamDetails\.aspx\?[^\"'<>\s)]+", text, re.IGNORECASE):
+            team_urls.add(urljoin(base + "/", m))
+        for m in re.findall(r"PlayerDetails\.aspx\?[^\"'<>\s)]+", text, re.IGNORECASE):
+            full = urljoin(base + "/", m)
+            pl_id = extract_query_param(full, "PlayerID")
+            if not pl_id:
+                continue
+            if pl_id not in player_urls or ("teamid=" in full.lower() and "teamid=" not in player_urls[pl_id].lower()):
+                player_urls[pl_id] = full
+        for pl_id in re.findall(r"PlayerID=(\d+)", text, re.IGNORECASE):
+            if pl_id not in player_urls:
+                player_urls[pl_id] = f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}"
 
     for url in seed_urls:
-        raw_html = html.unescape(fetch_html(session, url))
-        if not raw_html:
-            continue
-        for m in re.findall(r"CompetitionTeamDetails\.aspx\?[^\"'<>\s]+", raw_html, re.IGNORECASE):
-            team_urls.add(urljoin(base + "/", m))
-        for m in re.findall(r"PlayerID=(\d+)", raw_html, re.IGNORECASE):
-            found_ids.add(m)
+        raw = fetch_html(session, url)
+        if raw:
+            register_links(raw)
 
     for t_url in sorted(team_urls):
-        raw_html = html.unescape(fetch_html(session, t_url))
-        if not raw_html:
-            continue
-        for m in re.findall(r"PlayerID=(\d+)", raw_html, re.IGNORECASE):
-            found_ids.add(m)
+        raw = fetch_html(session, t_url)
+        if raw:
+            register_links(raw)
 
     added = 0
-    for pl_id in found_ids:
-        if pl_id not in existing_players:
+    for pl_id, p_url in player_urls.items():
+        if pl_id in existing_players:
+            if "teamid=" in p_url.lower():
+                existing_players[pl_id]["url"] = p_url
+        else:
             existing_players[pl_id] = {
                 "pl_id": pl_id,
-                "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
+                "url": p_url,
                 "name": "",
                 "team": "",
                 "country": "",
@@ -393,30 +452,37 @@ def discover_extra_players_from_teams(session, league, existing_players):
             }
             added += 1
 
-    print(f"[{league['name']}] Added {added} extra roster players from {len(team_urls)} team pages.")
+    print(f"[{league['name']}] Found {len(team_urls)} teams, updated URLs & added {added} extra roster players.")
     return existing_players
 
 
-def find_by_id_keywords(soup, keywords):
-    for kw in keywords:
-        el = soup.find(id=re.compile(kw, re.IGNORECASE))
-        if el:
-            txt = clean_text(el.get_text())
-            if txt:
-                return txt
-    return ""
+def parse_bio_from_text_lines(soup):
+    """Extracts Club, Position, Heigth/Height, Date Of Birth, Sport Nationality from page lines."""
+    lines = [clean_text(x) for x in soup.get_text("\n").splitlines()]
+    lines = [l for l in lines if l]
+    bio = {}
+
+    for i, line in enumerate(lines[:-1]):
+        low = line.rstrip(":").lower()
+        if low in KNOWN_BIO_LABELS:
+            nxt = lines[i + 1]
+            nxt_low = nxt.rstrip(":").lower()
+            if nxt_low not in KNOWN_BIO_LABELS and nxt not in ("-", "—", "N/A"):
+                bio.setdefault(low, nxt)
+    return bio
 
 
-def extract_label_value_pairs(soup):
-    pairs = {}
-    for row in soup.find_all(["tr", "div", "li", "p"]):
-        children = row.find_all(["span", "td", "th", "strong", "b", "label", "p"], recursive=False)
-        if len(children) == 2:
-            k = clean_text(children[0].get_text()).rstrip(":").lower()
-            v = clean_text(children[1].get_text())
-            if k and v and len(k) < 40 and len(v) < 80:
-                pairs[k] = v
-    return pairs
+def extract_name_from_title(soup):
+    if not soup.title:
+        return ""
+    raw = clean_text(soup.title.get_text())
+    # Example: "14 GALIOTOS Markos - Competition Site by Data Project"
+    left = raw.split(" - ")[0].strip()
+    left = re.sub(r"^\d+\s+", "", left).strip()
+    low = left.lower()
+    if not left or any(bad in low for bad in ["competition site", "player details", "campionat", "divizia", "league"]):
+        return ""
+    return left
 
 
 def enrich_player_profile(league, pl_id, data, debug_first=False):
@@ -434,61 +500,39 @@ def enrich_player_profile(league, pl_id, data, debug_first=False):
 
     if raw_html:
         soup = BeautifulSoup(raw_html, "lxml")
+        bio = parse_bio_from_text_lines(soup)
 
         if debug_first:
-            lbls = {
-                el.get("id"): clean_text(el.get_text())
-                for el in soup.find_all(id=re.compile(r"LBL_|Content_Main", re.IGNORECASE))
-                if clean_text(el.get_text()) and len(clean_text(el.get_text())) < 80
-            }
-            print(f"[DEBUG] Sample PlayerDetails labels ({data['url']}): {list(lbls.items())[:20]}")
-
-        pairs = extract_label_value_pairs(soup)
+            print(f"[DEBUG] Sample title: {soup.title.get_text() if soup.title else ''}")
+            print(f"[DEBUG] Sample parsed bio ({data['url']}): {bio}")
 
         if not name:
-            name = find_by_id_keywords(soup, ["lbl_player", "playername", "lblname", "surname"])
-            if not name:
-                h = soup.find(["h1", "h2", "h3"])
-                name = clean_text(h.get_text()) if h else f"Player {pl_id}"
+            name = extract_name_from_title(soup)
 
         if not team:
-            team = find_by_id_keywords(soup, ["lbl_team", "teamname", "lblteam"])
+            team = bio.get("club") or bio.get("team") or ""
 
-        raw_pos = find_by_id_keywords(soup, ["lbl_role", "position", "role", "ruolo", "post"])
-        if not raw_pos:
-            for k, v in pairs.items():
-                if any(w in k for w in ["role", "position", "post", "rol", "ruolo"]):
-                    raw_pos = v
-                    break
+        raw_pos = bio.get("position") or bio.get("role") or ""
 
-        raw_height = find_by_id_keywords(soup, ["lbl_height", "height", "altezza", "inaltime"])
-        if not raw_height:
-            for k, v in pairs.items():
-                if any(w in k for w in ["height", "înălțime", "inaltime", "altezza", "cm"]):
-                    raw_height = v
-                    break
+        raw_height = (
+            bio.get("heigth")
+            or bio.get("height")
+            or bio.get("înălțime")
+            or bio.get("inaltime")
+            or ""
+        )
         h_val = to_int(raw_height)
         if 140 <= h_val <= 235:
             height_cm = h_val
 
-        raw_birth = find_by_id_keywords(soup, ["lbl_birth", "birthdate", "born", "nascita", "dob"])
-        if not raw_birth:
-            for k, v in pairs.items():
-                if any(w in k for w in ["birth", "born", "nașter", "naster", "nascita"]):
-                    raw_birth = v
-                    break
+        raw_birth = bio.get("date of birth") or bio.get("birth date") or ""
         ym = re.search(r"(19\d{2}|20[0-1]\d)", raw_birth)
         if ym:
             birth_year = int(ym.group(1))
             age = datetime.now().year - birth_year
 
         if not nationality:
-            nationality = find_by_id_keywords(soup, ["lbl_nation", "nationality", "citizenship", "country"])
-            if not nationality:
-                for k, v in pairs.items():
-                    if any(w in k for w in ["nation", "citizen", "country", "țară", "tara"]):
-                        nationality = v
-                        break
+            nationality = bio.get("sport nationality") or bio.get("nationality") or ""
 
         img = soup.find("img", id=re.compile(r"player|photo|img", re.IGNORECASE))
         if img and img.get("src"):
