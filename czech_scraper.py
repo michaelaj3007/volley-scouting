@@ -1,7 +1,8 @@
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -11,16 +12,21 @@ HEADERS = {
 }
 
 CZ_ROLE_MAP = {
-    "nahrávač": "Setter", "nahravac": "Setter", "setter": "Setter",
-    "univerzál": "Opposite", "univerzal": "Opposite", "opposite": "Opposite",
-    "smečař": "Outside Hitter", "smecar": "Outside Hitter", "outside": "Outside Hitter",
-    "blokař": "Middle Blocker", "blokar": "Middle Blocker", "middle": "Middle Blocker",
+    "nahravac": "Setter", "setter": "Setter",
+    "univerzal": "Opposite", "opposite": "Opposite",
+    "smecar": "Outside Hitter", "outside": "Outside Hitter",
+    "blokar": "Middle Blocker", "middle": "Middle Blocker",
     "libero": "Libero",
 }
 
 
 def clean(text):
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def strip_accents(text):
+    norm = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in norm if not unicodedata.combining(ch))
 
 
 def to_float(val):
@@ -36,22 +42,16 @@ def to_int(val):
 
 
 def norm_pos(raw):
-    low = clean(raw).lower()
+    low = strip_accents(clean(raw)).lower()
     for k, v in CZ_ROLE_MAP.items():
         if k in low:
             return v
     return clean(raw) or "Unknown"
 
 
-def make_key(name, href):
-    if href:
-        path = urlparse(href).path.strip("/")
-        m = re.search(r"(\d{3,})", path)
-        if m:
-            return m.group(1)
-        if "hrac" in path.lower() or "player" in path.lower():
-            return re.sub(r"\W+", "_", path.lower())
-    return re.sub(r"\W+", "_", name.lower()).strip("_")
+def make_key(name):
+    slug = re.sub(r"[^a-z0-9]+", "_", strip_accents(clean(name)).lower()).strip("_")
+    return slug or "unknown"
 
 
 def find_item_el(sn):
@@ -103,7 +103,7 @@ def extract_sections(soup, page_url):
 
         heads = [
             clean(h.get_text(" ")) for h in box.select("h1, h2, h3, h4, [class*='head'], [class*='title']")
-            if not lp.find(lambda tag: tag is h) and clean(h.get_text(" ")) and clean(h.get_text(" ")).lower() != "další"
+            if not lp.find(lambda tag: tag is h) and clean(h.get_text(" ")) and strip_accents(clean(h.get_text(" "))).lower() != "dalsi"
         ]
         title = " | ".join(dict.fromkeys(heads)) or page_head
 
@@ -111,7 +111,7 @@ def extract_sections(soup, page_url):
         for a in box.find_all("a", href=True):
             if lp.find(lambda tag: tag is a):
                 continue
-            if re.search(r"další|zobrazit|vše", clean(a.get_text(" ")), re.IGNORECASE):
+            if re.search(r"dalsi|zobrazit|vse", strip_accents(clean(a.get_text(" "))), re.IGNORECASE):
                 dalsi_href = urljoin(page_url, a["href"])
                 break
 
@@ -156,18 +156,21 @@ def extract_sections(soup, page_url):
 
 
 def apply_section(merged, league, title, items, src_url):
-    t = f"{title} {src_url}".lower()
-    is_serve = any(k in t for k in ["podáv", "podav", "podán", "podan", "esa", "eso", "serv"])
+    t = strip_accents(f"{title} {src_url}").lower()
+    is_serve = any(k in t for k in ["podav", "podan", "esa", "eso", "serv"])
     is_block = "blok" in t or "block" in t
-    is_attack = any(k in t for k in ["útoč", "utoc", "útok", "utok", "smeč", "smec", "att"])
-    is_rec = any(k in t for k in ["přij", "prij", "recep"])
-    is_points = (not (is_serve or is_block or is_attack or is_rec)) or any(k in t for k in ["boduj", "celkem bod", "body/set"])
-    has_sets = "set" in t
+    is_attack = any(k in t for k in ["utoc", "utok", "smec", "att"])
+    is_rec = any(k in t for k in ["prij", "recep"])
+    is_points = any(k in t for k in ["boduj", "celkem bod", "body/set", "nejvice bod"])
+    has_sets = "set" in t and "pokus" not in t
+
+    if not (is_serve or is_block or is_attack or is_rec or is_points):
+        return
 
     for it in items:
         name = it["name"]
         href = it["href"]
-        fid = f"{league['country']}_{league['competition_id']}_{make_key(name, href)}"
+        fid = f"{league['country']}_{league['competition_id']}_{make_key(name)}"
         if fid not in merged:
             merged[fid] = {
                 "player_id": fid, "league": league["name"], "country": league["country"], "gender": league.get("gender", ""),
@@ -185,7 +188,7 @@ def apply_section(merged, league, title, items, src_url):
             rec["team"] = it["team"]
         if not rec["photo_url"] and it["photo"]:
             rec["photo_url"] = it["photo"]
-        if href and href != src_url:
+        if href and href != src_url and "/zebricky/" not in href.lower():
             rec["profile_url"] = href
 
         raw = it["stats"]
@@ -204,7 +207,7 @@ def apply_section(merged, league, title, items, src_url):
                 rec["serve_total"] = max(rec["serve_total"], f_den)
         elif is_block:
             rec["blocks"] = max(rec["blocks"], f_num if f_num else (0 if (is_pct or has_sets) else to_int(val)))
-            if has_sets or not is_pct:
+            if has_sets and not is_pct:
                 rec["sets"] = max(rec["sets"], f_den)
         elif is_attack:
             if is_pct or "%" in t:
@@ -218,14 +221,15 @@ def apply_section(merged, league, title, items, src_url):
                 else:
                     rec["attack_total"] = max(rec["attack_total"], f_den)
         elif is_rec:
-            if any(k in t for k in ["excel", "perf", "výborn", "vyborn"]):
+            if any(k in t for k in ["excel", "perf", "vyborn"]):
                 rec["reception_perf_pct"] = round(val, 1)
             else:
                 rec["reception_pos_pct"] = round(val, 1)
             rec["reception_total"] = max(rec["reception_total"], f_den)
         elif is_points:
             rec["points"] = max(rec["points"], f_num or to_int(val))
-            rec["sets"] = max(rec["sets"], f_den)
+            if not is_pct and "pokus" not in t:
+                rec["sets"] = max(rec["sets"], f_den)
 
 
 def enrich_bio(session, rec):
@@ -242,21 +246,25 @@ def enrich_bio(session, rec):
             if ta:
                 rec["team"] = clean(ta.get_text(" "))
         lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
-        for i, line in enumerate(lines[:-1]):
-            low, nxt = line.rstrip(":").lower(), lines[i + 1]
-            if low in ("post", "pozice", "position") and rec["position"] == "Unknown":
-                rec["raw_position"], rec["position"] = nxt, norm_pos(nxt)
-            elif low in ("výška", "vyska", "height") and rec["height_cm"] == 0:
-                h = to_int(nxt)
+        for i, line in enumerate(lines):
+            low = strip_accents(line).lower()
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            val_same = line.split(":", 1)[1].strip() if ":" in line else ""
+            cand = val_same or nxt
+            key_lbl = low.split(":", 1)[0].strip()
+            if key_lbl in ("post", "pozice", "position") and rec["position"] == "Unknown" and cand:
+                rec["raw_position"], rec["position"] = cand, norm_pos(cand)
+            elif key_lbl in ("vyska", "height") and rec["height_cm"] == 0 and cand:
+                h = to_int(cand)
                 if 140 <= h <= 235:
                     rec["height_cm"] = h
-            elif low in ("datum narození", "narození", "ročník", "narozen") and rec["birth_year"] == 0:
-                ym = re.search(r"(19\d{2}|20[0-1]\d)", nxt)
+            elif key_lbl in ("datum narozeni", "narozeni", "rocnik", "narozen") and rec["birth_year"] == 0 and cand:
+                ym = re.search(r"(19\d{2}|20[0-1]\d)", cand)
                 if ym:
                     rec["birth_year"] = int(ym.group(1))
                     rec["age"] = datetime.now().year - rec["birth_year"]
-            elif low in ("klub", "družstvo", "tým", "team") and not rec["team"]:
-                rec["team"] = nxt
+            elif key_lbl in ("klub", "druzstvo", "tym", "team") and not rec["team"] and cand:
+                rec["team"] = cand
     except Exception:
         pass
     return rec
@@ -283,7 +291,7 @@ def scrape_cvf_cz_league(browser, session, league):
                 seen.add(href.rstrip("/"))
                 subpages.append((sec["title"], href))
 
-        for p_title, s_url in subpages[:12]:
+        for p_title, s_url in subpages[:15]:
             try:
                 page.goto(s_url, wait_until="networkidle", timeout=35000)
                 page.wait_for_selector(".list__item__surname", timeout=10000)
