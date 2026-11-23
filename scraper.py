@@ -10,6 +10,12 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -131,21 +137,15 @@ def normalize_header(h):
     return re.sub(r"\s+", " ", clean_text(h).lower())
 
 
-def find_col(col_map, exact_candidates, contains_candidates=None):
+def find_col(headers, exact_candidates, start_idx=0, end_idx=None):
+    end_idx = len(headers) if end_idx is None else min(end_idx, len(headers))
     for cand in exact_candidates:
         c_norm = normalize_header(cand)
-        if c_norm in col_map:
-            return col_map[c_norm]
-        c_nospace = c_norm.replace(" ", "")
-        for h, idx in col_map.items():
-            if h.replace(" ", "") == c_nospace:
-                return idx
-    if contains_candidates:
-        for cand in contains_candidates:
-            c_norm = normalize_header(cand)
-            for h, idx in col_map.items():
-                if c_norm in h:
-                    return idx
+        c_ns = c_norm.replace(" ", "")
+        for i in range(start_idx, end_idx):
+            h = headers[i]
+            if h == c_norm or h.replace(" ", "") == c_ns:
+                return i
     return None
 
 
@@ -155,231 +155,291 @@ def cell_val(cells, idx, default=""):
     return default
 
 
-def find_all_players_grid_rows(soup, header_table, header_row_idx):
-    """Handles Telerik RadGrid where headers (rgHeaderDiv) and data (rgDataDiv) are in separate tables."""
-    grid = header_table.find_parent(class_=re.compile(r"RadGrid", re.IGNORECASE))
-    if grid:
-        rg_rows = grid.select("tr.rgRow, tr.rgAltRow")
-        if rg_rows:
-            return rg_rows
-        data_div = grid.find(class_=re.compile(r"rgDataDiv", re.IGNORECASE))
-        if data_div:
-            rows = data_div.find_all("tr")
-            if rows:
-                return rows
+def parse_radgrid_page(soup, league):
+    """Parses one rendered page of Statistics_AllPlayers.aspx and returns (players_dict, headers_len)."""
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
 
-    global_rg_rows = soup.select("tr.rgRow, tr.rgAltRow")
-    if global_rg_rows:
-        return global_rg_rows
+    headers = []
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr")[:5]:
+            h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
+            if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
+                headers = h_cells
+                break
+        if headers:
+            break
 
-    return header_table.find_all("tr")[header_row_idx + 1 :]
+    if not headers:
+        return {}, 0
+
+    i_pid = find_col(headers, ["playerid", "player id", "id"])
+    i_player = find_col(headers, ["player", "jucător", "jucator"])
+    i_surname = find_col(headers, ["surname", "last name"])
+    i_name = find_col(headers, ["name", "first name"])
+    i_team = find_col(headers, ["team", "echipa", "club"])
+    i_country = find_col(headers, ["country", "nation", "nat"])
+    i_matches = find_col(headers, ["matches", "meciuri", "played", "m"])
+    i_sets = find_col(headers, ["sets", "seturi", "s"])
+    i_points = find_col(headers, ["points", "puncte", "pts", "tot"])
+    i_bp = find_col(headers, ["bp", "break points"])
+    i_wl = find_col(headers, ["w-p", "w-l", "wl"])
+
+    # Serve
+    i_s_err = find_col(headers, ["s =", "s=", "s err"])
+    i_s_ok = find_col(headers, ["s !", "s!"])
+    i_s_slash = find_col(headers, ["s /", "s/"])
+    i_s_neg = find_col(headers, ["s -", "s-"])
+    i_s_pos = find_col(headers, ["s +", "s+"])
+    i_s_ace = find_col(headers, ["s #", "s#", "s pts", "aces", "ace"])
+
+    # Reception
+    i_r_err = find_col(headers, ["r =", "r=", "r err"])
+    i_r_ok = find_col(headers, ["r !", "r!"])
+    i_r_slash = find_col(headers, ["r /", "r/"])
+    i_r_neg = find_col(headers, ["r -", "r-"])
+    i_r_pos = find_col(headers, ["r +", "r+"])
+    i_r_perf = find_col(headers, ["r #", "r#"])
+
+    # Attack
+    i_a_err = find_col(headers, ["a =", "a=", "a err"])
+    i_a_ok = find_col(headers, ["a !", "a!"])
+    i_a_blk = find_col(headers, ["a /", "a/", "a blk"])
+    i_a_neg = find_col(headers, ["a -", "a-"])
+    i_a_pos = find_col(headers, ["a +", "a+"])
+    i_a_pts = find_col(headers, ["a #", "a#", "a pts", "atk pts"])
+
+    # Block
+    i_b_err = find_col(headers, ["b =", "b="])
+    i_b_pts = find_col(headers, ["b #", "b#", "b pts", "blk", "blocks", "block"])
+
+    # Percentages scoped strictly between sections so Reception exc.% and Attack exc.% never collide
+    r_start = i_r_perf if i_r_perf is not None else 0
+    r_end = i_a_err if i_a_err is not None else len(headers)
+    i_r_pos_pct = find_col(headers, ["pos%", "r pos%", "rec pos%"], r_start, r_end)
+    i_r_perf_pct = find_col(headers, ["exc.%", "exc%", "perf%", "r perf%"], r_start, r_end)
+
+    a_start = i_a_pts if i_a_pts is not None else 0
+    a_end = i_b_err if i_b_err is not None else len(headers)
+    i_a_pct = find_col(headers, ["exc. %", "exc.%", "exc%", "a %", "atk %"], a_start, a_end)
+
+    data_rows = soup.select("tr.rgRow, tr.rgAltRow")
+    page_players = {}
+
+    for tr in data_rows:
+        cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
+        if len(cells) < 10:
+            continue
+
+        pl_id = re.sub(r"[^0-9]", "", cell_val(cells, i_pid))
+        if not pl_id:
+            link = tr.find("a", href=re.compile(r"PlayerID=", re.IGNORECASE))
+            if link:
+                pl_id = extract_query_param(urljoin(base + "/", link["href"]), "PlayerID")
+        if not pl_id:
+            continue
+
+        first_n = cell_val(cells, i_name)
+        last_n = cell_val(cells, i_surname)
+        raw_player = cell_val(cells, i_player)
+        if last_n or first_n:
+            full_name = f"{last_n} {first_n}".strip()
+        else:
+            full_name = re.sub(r"\s*\([^)]*\)\s*$", "", raw_player).strip()
+
+        matches = to_int(cell_val(cells, i_matches))
+        sets = to_int(cell_val(cells, i_sets))
+        points = to_int(cell_val(cells, i_points))
+        bp = to_int(cell_val(cells, i_bp))
+        wl = to_int(cell_val(cells, i_wl))
+
+        # Serve
+        s_err = to_int(cell_val(cells, i_s_err))
+        s_ok = to_int(cell_val(cells, i_s_ok))
+        s_slash = to_int(cell_val(cells, i_s_slash))
+        s_neg = to_int(cell_val(cells, i_s_neg))
+        s_pos = to_int(cell_val(cells, i_s_pos))
+        aces = to_int(cell_val(cells, i_s_ace))
+        s_tot = s_err + s_ok + s_slash + s_neg + s_pos + aces
+
+        # Reception
+        r_err = to_int(cell_val(cells, i_r_err))
+        r_ok = to_int(cell_val(cells, i_r_ok))
+        r_slash = to_int(cell_val(cells, i_r_slash))
+        r_neg = to_int(cell_val(cells, i_r_neg))
+        r_pos = to_int(cell_val(cells, i_r_pos))
+        r_perf = to_int(cell_val(cells, i_r_perf))
+        r_tot = r_err + r_ok + r_slash + r_neg + r_pos + r_perf
+        rec_pos_pct = to_float(cell_val(cells, i_r_pos_pct))
+        if rec_pos_pct == 0.0 and r_tot > 0:
+            rec_pos_pct = round(100.0 * (r_pos + r_perf) / r_tot, 1)
+        rec_perf_pct = to_float(cell_val(cells, i_r_perf_pct))
+        if rec_perf_pct == 0.0 and r_tot > 0:
+            rec_perf_pct = round(100.0 * r_perf / r_tot, 1)
+
+        # Attack
+        a_err = to_int(cell_val(cells, i_a_err))
+        a_ok = to_int(cell_val(cells, i_a_ok))
+        a_blk = to_int(cell_val(cells, i_a_blk))
+        a_neg = to_int(cell_val(cells, i_a_neg))
+        a_pos = to_int(cell_val(cells, i_a_pos))
+        a_pts = to_int(cell_val(cells, i_a_pts))
+        a_tot = a_err + a_ok + a_blk + a_neg + a_pos + a_pts
+        atk_pct = to_float(cell_val(cells, i_a_pct))
+        if atk_pct == 0.0 and a_tot > 0:
+            atk_pct = round(100.0 * a_pts / a_tot, 1)
+        atk_eff_pct = round(100.0 * (a_pts - a_err - a_blk) / a_tot, 1) if a_tot > 0 else 0.0
+
+        # Block
+        blocks = to_int(cell_val(cells, i_b_pts))
+
+        page_players[pl_id] = {
+            "pl_id": pl_id,
+            "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
+            "name": full_name,
+            "team": cell_val(cells, i_team),
+            "country": cell_val(cells, i_country),
+            "matches": matches,
+            "sets": sets,
+            "points": points,
+            "break_points": bp,
+            "won_lost": wl,
+            "serve_total": s_tot,
+            "aces": aces,
+            "serve_errors": s_err,
+            "reception_total": r_tot,
+            "reception_pos_pct": rec_pos_pct,
+            "reception_perf_pct": rec_perf_pct,
+            "attack_total": a_tot,
+            "attack_points": a_pts,
+            "attack_errors": a_err,
+            "attack_blocked": a_blk,
+            "attack_pct": atk_pct,
+            "attack_eff_pct": atk_eff_pct,
+            "blocks": blocks,
+        }
+
+    return page_players, len(headers)
 
 
-def scrape_all_players_table(session, league):
-    """Reads the complete Data Project Statistics_AllPlayers.aspx master table."""
+def scrape_all_players_playwright(league):
+    """Uses headless Chromium to render the JS Telerik RadGrid and paginate through all players."""
+    if not HAS_PLAYWRIGHT:
+        print("[WARN] Playwright not installed; skipping JS stats table.")
+        return {}
+
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", ""))
+    url = (
+        f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}"
+        if pid
+        else f"{base}/Statistics_AllPlayers.aspx?ID={cid}"
+    )
 
-    urls = []
-    if pid:
-        urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}&PID={pid}")
-    urls.append(f"{base}/Statistics_AllPlayers.aspx?ID={cid}")
+    all_players = {}
 
-    players = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=HEADERS["User-Agent"],
+        )
+        page = context.new_page()
 
-    for url in urls:
-        raw_html = fetch_html(session, url)
-        if not raw_html:
-            continue
-        soup = BeautifulSoup(raw_html, "lxml")
+        try:
+            print(f"[{league['name']}] Opening browser on {url}")
+            page.goto(url, wait_until="networkidle", timeout=45000)
 
-        target_table = None
-        header_row_idx = 0
-        headers = []
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const rows = document.querySelectorAll('tr.rgRow, tr.rgAltRow');
+                        for (const r of rows) {
+                            if ((r.textContent || '').trim().length > 10) return true;
+                        }
+                        return false;
+                    }""",
+                    timeout=20000,
+                )
+            except Exception:
+                print(f"[WARN] Timed out waiting for populated RadGrid rows on {url}")
 
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if not rows:
-                continue
-            for r_i, tr in enumerate(rows[:5]):
-                h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
-                if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
-                    target_table = table
-                    header_row_idx = r_i
-                    headers = h_cells
+            # Try to maximize rows per page via Telerik client API if supported, otherwise paginate
+            prev_sig = None
+            for page_num in range(1, 50):
+                soup = BeautifulSoup(page.content(), "lxml")
+                batch, ncols = parse_radgrid_page(soup, league)
+                if not batch:
+                    if page_num == 1:
+                        print(f"[DEBUG] Page 1 had 0 parsed players (ncols={ncols}).")
                     break
-            if target_table:
-                break
 
-        if not target_table:
-            continue
+                curr_sig = tuple(list(batch.keys())[:3])
+                if curr_sig == prev_sig:
+                    break
+                prev_sig = curr_sig
 
-        print(f"[DEBUG] AllPlayers FULL headers ({len(headers)} cols): {headers}")
+                new_count = 0
+                for pl_id, rec in batch.items():
+                    if pl_id not in all_players:
+                        new_count += 1
+                    all_players[pl_id] = rec
 
-        data_rows = find_all_players_grid_rows(soup, target_table, header_row_idx)
-        print(f"[DEBUG] AllPlayers data_rows found: {len(data_rows)}")
+                if page_num == 1:
+                    sample_rec = next(iter(batch.values()))
+                    print(
+                        f"[DEBUG] Page 1 sample: {sample_rec['name']} ({sample_rec['team']}) "
+                        f"Sets={sample_rec['sets']} Pts={sample_rec['points']} "
+                        f"Aces={sample_rec['aces']} Blk={sample_rec['blocks']} Atk%={sample_rec['attack_pct']}"
+                    )
 
-        col_map = {}
-        for i, h in enumerate(headers):
-            if h and h not in col_map:
-                col_map[h] = i
+                if new_count == 0:
+                    break
 
-        i_pid = find_col(col_map, ["playerid", "player id", "id"])
-        i_player = find_col(col_map, ["player", "jucător", "jucator"])
-        i_surname = find_col(col_map, ["surname", "last name"])
-        i_name = find_col(col_map, ["name", "first name"])
-        i_team = find_col(col_map, ["team", "echipa", "club"])
-        i_country = find_col(col_map, ["country", "nation", "nat"])
-        i_matches = find_col(col_map, ["matches", "meciuri", "played", "m"])
-        i_sets = find_col(col_map, ["sets", "seturi", "s"])
-        i_points = find_col(col_map, ["points", "puncte", "pts", "tot"])
-        i_bp = find_col(col_map, ["bp", "break points"])
-        i_wl = find_col(col_map, ["w-p", "w-l", "wl"])
+                # Click Next Page button
+                prev_first_text = page.evaluate(
+                    "() => { const r = document.querySelector('tr.rgRow'); return r ? (r.textContent || '').trim() : ''; }"
+                )
 
-        # Serve columns
-        i_s_err = find_col(col_map, ["s =", "s=", "s err", "srv err"])
-        i_s_ok = find_col(col_map, ["s !", "s!"])
-        i_s_slash = find_col(col_map, ["s /", "s/"])
-        i_s_neg = find_col(col_map, ["s -", "s-"])
-        i_s_pos = find_col(col_map, ["s +", "s+"])
-        i_s_ace = find_col(col_map, ["s #", "s#", "s pts", "aces", "ace", "srv pts"])
-        i_s_tot = find_col(col_map, ["s tot", "stot", "srv tot"])
+                next_btn = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext").first
+                if next_btn.count() == 0:
+                    break
 
-        # Reception columns
-        i_r_err = find_col(col_map, ["r =", "r=", "r err"])
-        i_r_slash = find_col(col_map, ["r /", "r/"])
-        i_r_neg = find_col(col_map, ["r -", "r-"])
-        i_r_ok = find_col(col_map, ["r !", "r!"])
-        i_r_pos = find_col(col_map, ["r +", "r+"])
-        i_r_perf = find_col(col_map, ["r #", "r#"])
-        i_r_tot = find_col(col_map, ["r tot", "rtot", "rec tot"])
-        i_r_pos_pct = find_col(col_map, ["r pos%", "pos%", "rec pos%", "r %"])
-        i_r_perf_pct = find_col(col_map, ["r perf%", "r exc%", "perf%", "exc%"])
+                is_disabled = next_btn.evaluate(
+                    """el => {
+                        const oc = (el.getAttribute('onclick') || '').toLowerCase();
+                        return el.disabled || el.classList.contains('rgDisabled') || oc.includes('return false');
+                    }"""
+                )
+                if is_disabled:
+                    break
 
-        # Attack columns
-        i_a_err = find_col(col_map, ["a =", "a=", "a err"])
-        i_a_blk = find_col(col_map, ["a /", "a/", "a blk"])
-        i_a_neg = find_col(col_map, ["a -", "a-"])
-        i_a_ok = find_col(col_map, ["a !", "a!"])
-        i_a_pos = find_col(col_map, ["a +", "a+"])
-        i_a_pts = find_col(col_map, ["a #", "a#", "a pts", "atk pts", "attack pts"])
-        i_a_tot = find_col(col_map, ["a tot", "atot", "atk tot"])
-        i_a_pct = find_col(col_map, ["a %", "a%", "a exc%", "atk %", "attack %"])
+                next_btn.click(force=True)
+                try:
+                    page.wait_for_function(
+                        """(prevText) => {
+                            const r = document.querySelector('tr.rgRow');
+                            const cur = r ? (r.textContent || '').trim() : '';
+                            return cur.length > 10 && cur !== prevText;
+                        }""",
+                        arg=prev_first_text,
+                        timeout=10000,
+                    )
+                except Exception:
+                    break
 
-        # Block columns
-        i_b_pts = find_col(col_map, ["b #", "b#", "b pts", "blk", "blocks", "block", "bl"])
+            print(f"[{league['name']}] Browser scraped {len(all_players)} players with full stats.")
+        except Exception as exc:
+            print(f"[WARN] Playwright error on {url}: {exc}")
+        finally:
+            browser.close()
 
-        sample_printed = False
-
-        for tr in data_rows:
-            cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
-            if len(cells) < 5:
-                continue
-
-            if not sample_printed:
-                print(f"[DEBUG] Sample AllPlayers row ({len(cells)} cells): {cells[:25]}")
-                sample_printed = True
-
-            pl_id = re.sub(r"[^0-9]", "", cell_val(cells, i_pid))
-            if not pl_id:
-                link = tr.find("a", href=re.compile(r"PlayerID=", re.IGNORECASE))
-                if link:
-                    pl_id = extract_query_param(urljoin(base + "/", link["href"]), "PlayerID")
-            if not pl_id:
-                continue
-
-            first_n = cell_val(cells, i_name)
-            last_n = cell_val(cells, i_surname)
-            full_name = f"{last_n} {first_n}".strip() if (first_n or last_n) else cell_val(cells, i_player)
-
-            matches = to_int(cell_val(cells, i_matches))
-            sets = to_int(cell_val(cells, i_sets))
-            points = to_int(cell_val(cells, i_points))
-            bp = to_int(cell_val(cells, i_bp))
-            wl = to_int(cell_val(cells, i_wl))
-
-            # Serve
-            s_err = to_int(cell_val(cells, i_s_err))
-            s_ok = to_int(cell_val(cells, i_s_ok))
-            s_slash = to_int(cell_val(cells, i_s_slash))
-            s_neg = to_int(cell_val(cells, i_s_neg))
-            s_pos = to_int(cell_val(cells, i_s_pos))
-            aces = to_int(cell_val(cells, i_s_ace))
-            s_tot = to_int(cell_val(cells, i_s_tot))
-            if s_tot == 0:
-                s_tot = s_err + s_ok + s_slash + s_neg + s_pos + aces
-
-            # Reception
-            r_err = to_int(cell_val(cells, i_r_err))
-            r_slash = to_int(cell_val(cells, i_r_slash))
-            r_neg = to_int(cell_val(cells, i_r_neg))
-            r_ok = to_int(cell_val(cells, i_r_ok))
-            r_pos = to_int(cell_val(cells, i_r_pos))
-            r_perf = to_int(cell_val(cells, i_r_perf))
-            r_tot = to_int(cell_val(cells, i_r_tot))
-            if r_tot == 0:
-                r_tot = r_err + r_slash + r_neg + r_ok + r_pos + r_perf
-            rec_pos_pct = to_float(cell_val(cells, i_r_pos_pct))
-            if rec_pos_pct == 0.0 and r_tot > 0:
-                rec_pos_pct = round(100.0 * (r_pos + r_perf) / r_tot, 1)
-            rec_perf_pct = to_float(cell_val(cells, i_r_perf_pct))
-            if rec_perf_pct == 0.0 and r_tot > 0:
-                rec_perf_pct = round(100.0 * r_perf / r_tot, 1)
-
-            # Attack
-            a_err = to_int(cell_val(cells, i_a_err))
-            a_blk = to_int(cell_val(cells, i_a_blk))
-            a_neg = to_int(cell_val(cells, i_a_neg))
-            a_ok = to_int(cell_val(cells, i_a_ok))
-            a_pos = to_int(cell_val(cells, i_a_pos))
-            a_pts = to_int(cell_val(cells, i_a_pts))
-            a_tot = to_int(cell_val(cells, i_a_tot))
-            if a_tot == 0:
-                a_tot = a_err + a_blk + a_neg + a_ok + a_pos + a_pts
-            atk_pct = to_float(cell_val(cells, i_a_pct))
-            if atk_pct == 0.0 and a_tot > 0:
-                atk_pct = round(100.0 * a_pts / a_tot, 1)
-            atk_eff_pct = round(100.0 * (a_pts - a_err - a_blk) / a_tot, 1) if a_tot > 0 else 0.0
-
-            # Block
-            blocks = to_int(cell_val(cells, i_b_pts))
-
-            players[pl_id] = {
-                "pl_id": pl_id,
-                "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
-                "name": full_name,
-                "team": cell_val(cells, i_team),
-                "country": cell_val(cells, i_country),
-                "matches": matches,
-                "sets": sets,
-                "points": points,
-                "break_points": bp,
-                "won_lost": wl,
-                "serve_total": s_tot,
-                "aces": aces,
-                "serve_errors": s_err,
-                "reception_total": r_tot,
-                "reception_pos_pct": rec_pos_pct,
-                "reception_perf_pct": rec_perf_pct,
-                "attack_total": a_tot,
-                "attack_points": a_pts,
-                "attack_errors": a_err,
-                "attack_blocked": a_blk,
-                "attack_pct": atk_pct,
-                "attack_eff_pct": atk_eff_pct,
-                "blocks": blocks,
-            }
-
-        if players:
-            print(f"[{league['name']}] Loaded {len(players)} players from {url}")
-            break
-
-    return players
+    return all_players
 
 
 def discover_extra_players_from_teams(session, league, existing_players):
-    """Scans team rosters so we get TeamID URLs and players with 0 sets played."""
+    """Scans team rosters so we get TeamID URLs and catch players with 0 sets played."""
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
     pid = str(league.get("pid", ""))
@@ -392,7 +452,7 @@ def discover_extra_players_from_teams(session, league, existing_players):
         seed_urls.append(f"{base}/CompetitionStandings.aspx?ID={cid}&PID={pid}")
 
     team_urls = set()
-    player_urls = {}  # pl_id -> best PlayerDetails URL (preferring ones with TeamID)
+    player_urls = {}
 
     def register_links(raw_html):
         text = html.unescape(raw_html)
@@ -452,40 +512,41 @@ def discover_extra_players_from_teams(session, league, existing_players):
             }
             added += 1
 
-    print(f"[{league['name']}] Found {len(team_urls)} teams, updated URLs & added {added} extra roster players.")
+    print(f"[{league['name']}] Found {len(team_urls)} teams, added {added} extra roster players.")
     return existing_players
 
 
-def parse_bio_from_text_lines(soup):
-    """Extracts Club, Position, Heigth/Height, Date Of Birth, Sport Nationality from page lines."""
+def parse_bio_and_name_from_lines(soup):
     lines = [clean_text(x) for x in soup.get_text("\n").splitlines()]
     lines = [l for l in lines if l]
     bio = {}
+    name_guess = ""
 
-    for i, line in enumerate(lines[:-1]):
+    for i, line in enumerate(lines):
         low = line.rstrip(":").lower()
-        if low in KNOWN_BIO_LABELS:
+        if low == "shirt number" and i > 0 and not name_guess:
+            for back in range(1, min(4, i + 1)):
+                cand = re.sub(r"^\d+\s+", "", lines[i - back]).strip()
+                c_low = cand.lower()
+                if (
+                    cand
+                    and len(cand) >= 3
+                    and c_low not in KNOWN_BIO_LABELS
+                    and not any(bad in c_low for bad in ["image ", "select", "statistics", "home", "campionat"])
+                ):
+                    name_guess = cand
+                    break
+
+        if i < len(lines) - 1 and low in KNOWN_BIO_LABELS:
             nxt = lines[i + 1]
             nxt_low = nxt.rstrip(":").lower()
             if nxt_low not in KNOWN_BIO_LABELS and nxt not in ("-", "—", "N/A"):
                 bio.setdefault(low, nxt)
-    return bio
+
+    return bio, name_guess
 
 
-def extract_name_from_title(soup):
-    if not soup.title:
-        return ""
-    raw = clean_text(soup.title.get_text())
-    # Example: "14 GALIOTOS Markos - Competition Site by Data Project"
-    left = raw.split(" - ")[0].strip()
-    left = re.sub(r"^\d+\s+", "", left).strip()
-    low = left.lower()
-    if not left or any(bad in low for bad in ["competition site", "player details", "campionat", "divizia", "league"]):
-        return ""
-    return left
-
-
-def enrich_player_profile(league, pl_id, data, debug_first=False):
+def enrich_player_profile(league, pl_id, data):
     session = get_session()
     raw_html = fetch_html(session, data["url"])
 
@@ -500,14 +561,18 @@ def enrich_player_profile(league, pl_id, data, debug_first=False):
 
     if raw_html:
         soup = BeautifulSoup(raw_html, "lxml")
-        bio = parse_bio_from_text_lines(soup)
-
-        if debug_first:
-            print(f"[DEBUG] Sample title: {soup.title.get_text() if soup.title else ''}")
-            print(f"[DEBUG] Sample parsed bio ({data['url']}): {bio}")
+        bio, name_guess = parse_bio_and_name_from_lines(soup)
 
         if not name:
-            name = extract_name_from_title(soup)
+            # Try explicit Data Project player name spans first, then line before Shirt Number
+            el_sur = soup.find(id=re.compile(r"LBL_Surname|PlayerSurname", re.IGNORECASE))
+            el_nam = soup.find(id=re.compile(r"LBL_Name|PlayerName", re.IGNORECASE))
+            if el_sur or el_nam:
+                s_txt = clean_text(el_sur.get_text()) if el_sur else ""
+                n_txt = clean_text(el_nam.get_text()) if el_nam else ""
+                name = f"{s_txt} {n_txt}".strip()
+            if not name:
+                name = name_guess
 
         if not team:
             team = bio.get("club") or bio.get("team") or ""
@@ -614,20 +679,14 @@ def main():
 
     for league in leagues:
         print(f"=== Processing {league['name']} ===")
-        players = scrape_all_players_table(session, league)
+        players = scrape_all_players_playwright(league)
         players = discover_extra_players_from_teams(session, league, players)
 
         items = list(players.items())
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
-                executor.submit(
-                    enrich_player_profile,
-                    league,
-                    pl_id,
-                    pdata,
-                    idx == 0,
-                ): pl_id
-                for idx, (pl_id, pdata) in enumerate(items)
+                executor.submit(enrich_player_profile, league, pl_id, pdata): pl_id
+                for pl_id, pdata in items
             }
             for fut in as_completed(futures):
                 rec = fut.result()
