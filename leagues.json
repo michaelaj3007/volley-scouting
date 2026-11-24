@@ -3,108 +3,81 @@
     "name": "Greece - Volley League",
     "country": "Greece",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://hvl-web.dataproject.com",
-    "competition_id": "57",
-    "pid": "71"
+    "competition_id": "55",
+    "pid": "70"
   },
   {
     "name": "Romania - Divizia A1",
     "country": "Romania",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://frv-web.dataproject.com",
-    "competition_id": "51",
-    "pid": "58"
+    "competition_id": "77",
+    "pid": "80"
   },
   {
     "name": "Sweden - Elitserien",
     "country": "Sweden",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://svbf-web.dataproject.com",
-    "competition_id": "429",
-    "pid": ""
+    "competition_id": "453",
+    "pid": "565"
   },
   {
     "name": "Hungary - Extraliga",
     "country": "Hungary",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://hvf-web.dataproject.com",
-    "competition_id": "133",
-    "pid": ""
+    "competition_id": "64",
+    "pid": "71"
   },
   {
     "name": "Croatia - Superliga",
     "country": "Croatia",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://hos-web.dataproject.com",
-    "competition_id": "115",
-    "pid": ""
+    "competition_id": "141",
+    "pid": "162"
   },
   {
-    "name": "Bulgaria - Efbet Super Volley",
+    "name": "Bulgaria - Super Volley",
     "country": "Bulgaria",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://bvf-web.dataproject.com",
-    "competition_id": "99",
-    "pid": ""
+    "competition_id": "65",
+    "pid": "66"
   },
   {
     "name": "Finland - Mestaruusliiga",
     "country": "Finland",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://lml-web.dataproject.com",
-    "competition_id": "136",
-    "pid": ""
+    "competition_id": "156",
+    "pid": "191"
   },
   {
     "name": "Slovakia - Niké Extraliga",
     "country": "Slovakia",
     "gender": "M",
+    "season": "2026-27",
     "base_url": "https://svf-web.dataproject.com",
-    "competition_id": "84",
-    "pid": ""
+    "competition_id": "99",
+    "pid": "230"
   },
   {
     "name": "Czech Republic - Extraliga",
     "country": "Czech Republic",
     "gender": "M",
+    "season": "2026-27",
     "type": "cvf_cz",
     "competition_id": "ex-m",
     "url": "https://dv.cvf.cz/statistika/zebricky/2026-27/ex-m/"
-  },
-  {
-    "name": "USA - NCAA Division I",
-    "country": "USA",
-    "gender": "M",
-    "type": "ncaa_us",
-    "season": "2025-26",
-    "competition_id": "ncaa-d1",
-    "url": "https://stats.ncaa.org/rankings/national_ranking?academic_year=2026&division=1&sport_code=MVB"
-  },
-  {
-    "name": "USA - NCAA Division I",
-    "country": "USA",
-    "gender": "M",
-    "type": "ncaa_us",
-    "season": "2026-27",
-    "competition_id": "ncaa-d1",
-    "url": "https://stats.ncaa.org/rankings/national_ranking?academic_year=2027&division=1&sport_code=MVB"
-  },
-  {
-    "name": "Canada - U SPORTS",
-    "country": "Canada",
-    "gender": "M",
-    "type": "usports_ca",
-    "season": "2025-26",
-    "competition_id": "usports-m",
-    "url": "https://en.usports.ca/sports/mvball/2025-26/players?sort=pts&view=lineup&pos=all"
-  },
-  {
-    "name": "Canada - U SPORTS",
-    "country": "Canada",
-    "gender": "M",
-    "type": "usports_ca",
-    "season": "2026-27",
-    "competition_id": "usports-m",
-    "url": "https://en.usports.ca/sports/mvball/2026-27/players?sort=pts&view=lineup&pos=all"
   }
 ]
