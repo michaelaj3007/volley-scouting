@@ -56,50 +56,57 @@ def make_key(name, href):
     return slug or "unknown"
 
 
-def find_item_el(sn):
-    el = sn
-    for _ in range(5):
-        el = el.parent
-        if not el:
+def find_row_container(el):
+    cur = el
+    for _ in range(6):
+        cur = cur.parent
+        if not cur:
             break
-        if "list__item" in (el.get("class") or []):
-            return el
-    el = sn
-    while el and el.parent:
-        if len(el.parent.select(".list__item__surname")) > 1:
-            return el
-        el = el.parent
+        cls = " ".join(cur.get("class") or [])
+        if cur.name == "tr" or "list__item" in cls:
+            return cur
+    cur = el
+    while cur and cur.parent:
+        if len(cur.parent.select("a[href*='/hrac/'], .list__item__surname")) > 1:
+            return cur
+        cur = cur.parent
     return None
 
 
 def extract_sections(soup, page_url):
+    anchors = soup.select("a[href*='/hrac/']")
+    if not anchors:
+        anchors = soup.select(".list__item__surname")
+
     groups = {}
     order = []
-    for sn in soup.select(".list__item__surname"):
-        item = find_item_el(sn)
-        if not item or not item.parent:
+    seen_rows = set()
+
+    for el in anchors:
+        row = find_row_container(el)
+        if not row or not row.parent or id(row) in seen_rows:
             continue
-        lp = item.parent
+        seen_rows.add(id(row))
+        lp = row.parent
         key = id(lp)
         if key not in groups:
             groups[key] = (lp, [])
             order.append(key)
-        if item not in groups[key][1]:
-            groups[key][1].append(item)
+        groups[key][1].append(row)
 
     page_head = " | ".join(
         clean(h.get_text(" ")) for h in soup.select("h1, h2")
-        if not h.find_parent(class_="list__item") and clean(h.get_text(" "))
+        if not h.find_parent(["tr", "table"]) and "list__item" not in " ".join(h.get("class") or []) and clean(h.get_text(" "))
     )
 
     sections = []
     for key in order:
-        lp, items = groups[key]
-        my_cnt = len(lp.select(".list__item__surname"))
+        lp, rows = groups[key]
+        my_cnt = len(rows)
         box = lp
         for _ in range(4):
             p = box.parent
-            if not p or len(p.select(".list__item__surname")) != my_cnt:
+            if not p or len(p.select("a[href*='/hrac/'], .list__item__surname")) != my_cnt:
                 break
             box = p
 
@@ -110,39 +117,48 @@ def extract_sections(soup, page_url):
         title = " | ".join(dict.fromkeys(heads)) or page_head
 
         parsed_items = []
-        for item in items:
-            main_info = item.select_one(".list__item__main__info") or item
-            sn_el = item.select_one(".list__item__surname")
-            name_el = item.select_one(".list__item__highlighted, h3") or sn_el
-            surname = clean(sn_el.get_text(" ")) if sn_el else ""
-            full_name = clean(name_el.get_text(" ")) if name_el else surname
+        for row in rows:
+            a_el = row if row.name == "a" else (row.find("a", href=re.compile(r"/hrac/", re.IGNORECASE)) or row.find("a", href=True))
+            href = urljoin(page_url, a_el["href"]) if a_el and a_el.get("href") else page_url
+
+            main_info = row.select_one(".list__item__main__info")
+            sn_el = row.select_one(".list__item__surname")
+            name_el = row.select_one(".list__item__highlighted, h3") or (a_el if a_el and clean(a_el.get_text(" ")) else sn_el)
+            full_name = clean(name_el.get_text(" ")) if name_el else ""
+            if not full_name and a_el:
+                full_name = clean(a_el.get_text(" "))
+            full_name = re.sub(r"^\d+\.\s*", "", full_name).strip()
             if not full_name:
                 continue
 
-            if item.name == "a" and item.get("href"):
-                href = urljoin(page_url, item["href"])
-            else:
-                a_el = item.find("a", href=re.compile(r"/hrac/", re.IGNORECASE)) or item.find("a", href=True)
-                href = urljoin(page_url, a_el["href"]) if a_el else page_url
-
             team = ""
-            for img in main_info.find_all("img"):
+            search_area = main_info or row
+            for img in search_area.find_all("img"):
                 lbl = clean(img.get("alt") or img.get("title") or "")
-                if lbl and surname.lower() not in lbl.lower():
+                if lbl and lbl.lower() not in full_name.lower():
                     team = lbl
                     break
+            if not team:
+                t_el = row.select_one("[class*='team'], [class*='club'], [class*='tym']")
+                if t_el:
+                    team = clean(t_el.get_text(" "))
 
             photo = ""
-            for img in item.find_all("img"):
+            for img in row.find_all("img"):
                 src = img.get("src") or ""
                 if src and not re.search(r"no[-_]?photo|placeholder|default|logo|club|team", src, re.IGNORECASE):
                     photo = urljoin(page_url, src)
                     break
 
-            full_txt = clean(item.get_text(" "))
-            info_txt = clean(main_info.get_text(" "))
-            raw_stats = clean(full_txt.replace(info_txt, "", 1))
+            full_txt = clean(row.get_text(" "))
+            if main_info:
+                raw_stats = clean(full_txt.replace(clean(main_info.get_text(" ")), "", 1))
+            else:
+                raw_stats = clean(full_txt.replace(full_name, "", 1))
+                if team:
+                    raw_stats = clean(raw_stats.replace(team, "", 1))
             raw_stats = re.sub(r"^\d+\.\s*", "", raw_stats).strip()
+
             parsed_items.append({"name": full_name, "team": team, "href": href, "photo": photo, "stats": raw_stats})
 
         sections.append({"title": title, "items": parsed_items})
@@ -257,13 +273,12 @@ def scrape_cvf_cz_league(browser, session, league):
     try:
         print(f"[{league['name']}] Opening {entry_url}")
         page.goto(entry_url, wait_until="networkidle", timeout=45000)
-        page.wait_for_selector(".list__item__surname", timeout=15000)
+        page.wait_for_selector("a[href*='/hrac/'], .list__item__surname", timeout=15000)
 
         soup_main = BeautifulSoup(page.content(), "lxml")
         for sec in extract_sections(soup_main, entry_url):
             apply_section(merged, league, sec["title"], sec["items"], entry_url)
 
-        # Collect all DALŠÍ links (note: singular 'zebricek' in CVF URLs!)
         sub_urls = []
         for a in soup_main.find_all("a", href=True):
             full_href = urljoin(entry_url, a["href"])
@@ -282,10 +297,30 @@ def scrape_cvf_cz_league(browser, session, league):
                 resp = page.goto(s_url, wait_until="networkidle", timeout=30000)
                 if resp and resp.status >= 400:
                     continue
-                page.wait_for_selector(".list__item__surname", timeout=8000)
+                page.wait_for_selector("a[href*='/hrac/'], .list__item__surname", timeout=10000)
             except Exception:
                 continue
-            for sec in extract_sections(BeautifulSoup(page.content(), "lxml"), s_url):
+
+            for _ in range(15):
+                before_cnt = page.locator("a[href*='/hrac/']").count()
+                more_btn = page.locator("button:has-text('DALŠÍ'), a:has-text('DALŠÍ')").first
+                if more_btn.count() == 0:
+                    break
+                href_attr = more_btn.get_attribute("href") or ""
+                if href_attr and not href_attr.startswith("#") and "javascript:" not in href_attr.lower():
+                    break
+                try:
+                    more_btn.click(timeout=3000)
+                    page.wait_for_timeout(700)
+                except Exception:
+                    break
+                if page.locator("a[href*='/hrac/']").count() <= before_cnt:
+                    break
+
+            secs = extract_sections(BeautifulSoup(page.content(), "lxml"), s_url)
+            found_cnt = sum(len(s["items"]) for s in secs)
+            print(f"[DEBUG][CVF] {s_url} -> {found_cnt} player rows")
+            for sec in secs:
                 apply_section(merged, league, sec["title"], sec["items"], s_url)
 
         records = list(merged.values())
