@@ -1,15 +1,17 @@
 {
-  "last_updated_utc": "2026-11-24 08:36 UTC",
-  "total_players": 1243,
+  "last_updated_utc": "2026-11-24 11:17 UTC",
+  "total_players": 1144,
   "leagues": [
-    "Romania - Divizia A1 Men",
-    "Greece - Volley League Men",
-    "Sweden - Elitserien",
-    "Hungary - Extraliga",
-    "Croatia - Superliga",
     "Bulgaria - Efbet Super Volley",
+    "Canada - U SPORTS",
+    "Croatia - Superliga",
+    "Czech Republic - Extraliga",
     "Finland - Mestaruusliiga",
+    "Greece - Volley League",
+    "Hungary - Extraliga",
+    "Romania - Divizia A1",
     "Slovakia - Niké Extraliga",
-    "Czech Republic - Extraliga Men"
+    "Sweden - Elitserien",
+    "USA - NCAA Division I"
   ]
 }
