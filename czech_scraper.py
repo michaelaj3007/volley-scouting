@@ -13,15 +13,14 @@ HEADERS = {
 
 DEFAULT_CVF_SUBIDS = [
     "body_celkem",
-    "body_sety",
-    "eso_celkem",
-    "eso_sety",
-    "podani_uspesnost",
-    "blok_celkem",
-    "blok_sety",
+    "body_na_set",
+    "servisy_celkem",
+    "servisy_na_pokusy",
+    "bloky_celkem",
+    "bloky_na_set",
     "utok_celkem",
-    "utok_uspesnost",
-    "prijem_uspesnost",
+    "utok_na_pokusy",
+    "prijem_na_pokusy",
 ]
 
 
@@ -94,11 +93,6 @@ def extract_sections(soup, page_url):
             order.append(key)
         groups[key][1].append(row)
 
-    page_head = " | ".join(
-        clean(h.get_text(" ")) for h in soup.select("h1, h2")
-        if not h.find_parent(["tr", "table"]) and "list__item" not in " ".join(h.get("class") or []) and clean(h.get_text(" "))
-    )
-
     sections = []
     for key in order:
         lp, rows = groups[key]
@@ -111,10 +105,12 @@ def extract_sections(soup, page_url):
             box = p
 
         heads = [
-            clean(h.get_text(" ")) for h in box.select("h1, h2, h3, h4, [class*='head'], [class*='title']")
-            if not lp.find(lambda tag: tag is h) and clean(h.get_text(" ")) and strip_accents(clean(h.get_text(" "))).lower() != "dalsi"
+            clean(h.get_text(" ")) for h in box.select("h2, h3, h4, [class*='head'], [class*='title']")
+            if not lp.find(lambda tag: tag is h)
+            and clean(h.get_text(" "))
+            and strip_accents(clean(h.get_text(" "))).lower() not in ("dalsi", "zebricky", "statistika")
         ]
-        title = " | ".join(dict.fromkeys(heads)) or page_head
+        title = " | ".join(dict.fromkeys(heads))
 
         parsed_items = []
         for row in rows:
@@ -135,13 +131,15 @@ def extract_sections(soup, page_url):
             search_area = main_info or row
             for img in search_area.find_all("img"):
                 lbl = clean(img.get("alt") or img.get("title") or "")
-                if lbl and lbl.lower() not in full_name.lower():
+                if lbl and not lbl.isdigit() and lbl.lower() not in full_name.lower():
                     team = lbl
                     break
             if not team:
                 t_el = row.select_one("[class*='team'], [class*='club'], [class*='tym']")
                 if t_el:
-                    team = clean(t_el.get_text(" "))
+                    cand_t = clean(t_el.get_text(" "))
+                    if cand_t and not cand_t.isdigit() and cand_t.lower() not in full_name.lower():
+                        team = cand_t
 
             photo = ""
             for img in row.find_all("img"):
@@ -166,12 +164,14 @@ def extract_sections(soup, page_url):
 
 
 def apply_section(merged, league, title, items, src_url):
-    t = strip_accents(f"{title} {src_url}").lower()
-    is_serve = any(k in t for k in ["podav", "podan", "esa", "eso", "serv"])
-    is_block = "blok" in t or "block" in t
-    is_attack = any(k in t for k in ["utoc", "utok", "smec", "att"])
+    qs_id = (parse_qs(urlparse(src_url).query).get("id") or [""])[0].lower()
+    t = strip_accents(qs_id if qs_id else title).lower()
+
+    is_points = any(k in t for k in ["body", "boduj"])
+    is_serve = any(k in t for k in ["servis", "podav", "podan", "esa", "eso"])
+    is_block = "blok" in t
+    is_attack = any(k in t for k in ["utok", "utoc", "smec"])
     is_rec = any(k in t for k in ["prij", "recep"])
-    is_points = any(k in t for k in ["boduj", "celkem bod", "body/set", "nejvice bod", "id=body"])
     has_sets = "set" in t and "pokus" not in t
 
     if not (is_serve or is_block or is_attack or is_rec or is_points):
@@ -194,7 +194,7 @@ def apply_section(merged, league, title, items, src_url):
                 "profile_url": href, "photo_url": it["photo"],
             }
         rec = merged[fid]
-        if not rec["team"] and it["team"]:
+        if (not rec["team"] or rec["team"].isdigit()) and it["team"] and not it["team"].isdigit():
             rec["team"] = it["team"]
         if not rec["photo_url"] and it["photo"]:
             rec["photo_url"] = it["photo"]
@@ -209,7 +209,11 @@ def apply_section(merged, league, title, items, src_url):
         val = to_float(m_val.group(1)) if m_val else 0.0
         is_pct = (m_val.group(2) == "%") if m_val else False
 
-        if is_serve:
+        if is_points:
+            rec["points"] = max(rec["points"], f_num or (0 if (is_pct or has_sets) else to_int(val)))
+            if not is_pct and "pokus" not in t:
+                rec["sets"] = max(rec["sets"], f_den)
+        elif is_serve:
             rec["aces"] = max(rec["aces"], f_num if f_num else (0 if (is_pct or has_sets) else to_int(val)))
             if has_sets and not is_pct:
                 rec["sets"] = max(rec["sets"], f_den)
@@ -220,7 +224,7 @@ def apply_section(merged, league, title, items, src_url):
             if has_sets or not is_pct:
                 rec["sets"] = max(rec["sets"], f_den)
         elif is_attack:
-            if is_pct or "%" in t:
+            if is_pct or "%" in t or "pokus" in t:
                 rec["attack_eff_pct" if "efekt" in t else "attack_pct"] = round(val, 1)
                 rec["attack_points"] = max(rec["attack_points"], f_num)
                 rec["attack_total"] = max(rec["attack_total"], f_den)
@@ -236,10 +240,6 @@ def apply_section(merged, league, title, items, src_url):
             else:
                 rec["reception_pos_pct"] = round(val, 1)
             rec["reception_total"] = max(rec["reception_total"], f_den)
-        elif is_points:
-            rec["points"] = max(rec["points"], f_num or to_int(val))
-            if not is_pct and "pokus" not in t:
-                rec["sets"] = max(rec["sets"], f_den)
 
 
 def enrich_cvf_birth_and_team(session, rec):
@@ -251,10 +251,12 @@ def enrich_cvf_birth_and_team(session, rec):
         if resp.status_code != 200:
             return rec
         soup = BeautifulSoup(resp.text, "lxml")
-        if not rec["team"]:
+        if not rec["team"] or rec["team"].isdigit():
             ta = soup.find("a", href=re.compile(r"/tym|/druzstvo|/klub", re.IGNORECASE))
             if ta:
-                rec["team"] = clean(ta.get_text(" "))
+                cand_t = clean(ta.get_text(" "))
+                if cand_t and not cand_t.isdigit():
+                    rec["team"] = cand_t
         txt = clean(soup.get_text(" "))
         ym = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", txt)
         if ym and rec["birth_year"] == 0:
@@ -280,19 +282,11 @@ def scrape_cvf_cz_league(browser, session, league):
             apply_section(merged, league, sec["title"], sec["items"], entry_url)
 
         sub_urls = []
-        for a in soup_main.find_all("a", href=True):
-            full_href = urljoin(entry_url, a["href"])
-            if "/zebricek/" in full_href.lower() and full_href not in sub_urls:
-                sub_urls.append(full_href)
-
         base_cat = entry_url.replace("/zebricky/", "/zebricek/")
         for sub_id in DEFAULT_CVF_SUBIDS:
-            cand = f"{base_cat}?id={sub_id}"
-            if cand not in sub_urls:
-                sub_urls.append(cand)
+            sub_urls.append(f"{base_cat}?id={sub_id}")
 
-        print(f"[DEBUG][CVF] Visiting {len(sub_urls)} full ranking pages...")
-        for s_url in sub_urls[:14]:
+        for s_url in sub_urls:
             try:
                 resp = page.goto(s_url, wait_until="networkidle", timeout=30000)
                 if resp and resp.status >= 400:
@@ -318,8 +312,6 @@ def scrape_cvf_cz_league(browser, session, league):
                     break
 
             secs = extract_sections(BeautifulSoup(page.content(), "lxml"), s_url)
-            found_cnt = sum(len(s["items"]) for s in secs)
-            print(f"[DEBUG][CVF] {s_url} -> {found_cnt} player rows")
             for sec in secs:
                 apply_section(merged, league, sec["title"], sec["items"], s_url)
 
