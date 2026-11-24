@@ -3,10 +3,10 @@ import os
 import re
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import quote_plus, urljoin
 
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -69,6 +69,7 @@ def _parse_vb_player_page(html_text):
     pos = ""
     height_cm = 0
     birth_year = 0
+    nationality = ""
 
     for i, line in enumerate(lines):
         low = line.rstrip(":").lower()
@@ -93,7 +94,9 @@ def _parse_vb_player_page(html_text):
             if m_y:
                 birth_year = int(m_y.group(1))
 
-    # Fallback regex scan across page text
+        elif low in ("nationality", "country") and not nationality and val and len(val) <= 30:
+            nationality = val
+
     full_txt = " ".join(lines)
     if height_cm == 0:
         m_h = re.search(r"\b(1[7-9]\d|2[0-2]\d)\s*cm\b", full_txt, re.IGNORECASE)
@@ -106,13 +109,21 @@ def _parse_vb_player_page(html_text):
                 pos = mapped
                 break
 
-    return {"position": pos, "height_cm": height_cm, "birth_year": birth_year}
+    return {
+        "position": pos,
+        "height_cm": height_cm,
+        "birth_year": birth_year,
+        "nationality": nationality,
+    }
 
 
-def _lookup_player_on_volleybox(session, name, birth_year=0):
+def _lookup_player_on_volleybox(name, birth_year=0):
     tokens = _name_tokens(name)
     if len(tokens) < 2:
-        return None
+        return {"not_found": True}
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
     q = quote_plus(" ".join(tokens))
     search_urls = [
@@ -129,8 +140,11 @@ def _lookup_player_on_volleybox(session, name, birth_year=0):
             soup = BeautifulSoup(resp.text, "lxml")
             for a in soup.find_all("a", href=True):
                 href = urljoin("https://volleybox.net/", a["href"])
-                # Match Volleybox player URLs ending with -p12345
-                m = re.search(r"https?://(?:www\.)?volleybox\.net/(?:[a-z]{2}/)?([a-z0-9\-]+-p\d+)", href, re.IGNORECASE)
+                m = re.search(
+                    r"https?://(?:www\.)?volleybox\.net/(?:[a-z]{2}/)?([a-z0-9\-]+-p\d+)",
+                    href,
+                    re.IGNORECASE,
+                )
                 if not m:
                     continue
                 slug = m.group(1).lower()
@@ -145,37 +159,35 @@ def _lookup_player_on_volleybox(session, name, birth_year=0):
 
     for p_url in candidate_urls[:3]:
         try:
+            time.sleep(0.25)
             resp = session.get(p_url, timeout=15)
             if resp.status_code != 200:
                 continue
             info = _parse_vb_player_page(resp.text)
             if birth_year > 0 and info["birth_year"] > 0 and abs(birth_year - info["birth_year"]) > 1:
                 continue
-            if info["position"] or info["height_cm"] > 0 or info["birth_year"] > 0:
+            if info["position"] or info["height_cm"] > 0 or info["birth_year"] > 0 or info["nationality"]:
                 return info
         except Exception:
             continue
 
-    return None
+    return {"not_found": True}
 
 
-def enrich_missing_bios_from_volleybox(df, max_new_lookups=120):
+def enrich_missing_bios_from_volleybox(df, max_new_lookups=450):
     if df.empty:
         return df
 
     cache = _load_cache()
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    to_lookup = {}
 
-    lookups_done = 0
-    updated_rows = 0
-
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         need_pos = str(row.get("position", "")).strip() in ("", "Unknown")
         need_h = int(row.get("height_cm", 0) or 0) == 0
         need_b = int(row.get("birth_year", 0) or 0) == 0
+        need_nat = str(row.get("nationality", "")).strip() == ""
 
-        if not (need_pos or need_h or need_b):
+        if not (need_pos or need_h or need_b or need_nat):
             continue
 
         name = str(row.get("name", "")).strip()
@@ -184,16 +196,37 @@ def enrich_missing_bios_from_volleybox(df, max_new_lookups=120):
         if not cache_key.strip("_0"):
             continue
 
-        if cache_key in cache:
-            info = cache[cache_key]
-        else:
-            if lookups_done >= max_new_lookups:
-                continue
-            info = _lookup_player_on_volleybox(session, name, b_year) or {"not_found": True}
-            cache[cache_key] = info
-            lookups_done += 1
-            time.sleep(0.35)
+        if cache_key not in cache and cache_key not in to_lookup and len(to_lookup) < max_new_lookups:
+            to_lookup[cache_key] = (name, b_year)
 
+    if to_lookup:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {
+                ex.submit(_lookup_player_on_volleybox, nm, by): ck
+                for ck, (nm, by) in to_lookup.items()
+            }
+            for fut in as_completed(futures):
+                ck = futures[fut]
+                try:
+                    cache[ck] = fut.result()
+                except Exception:
+                    cache[ck] = {"not_found": True}
+        _save_cache(cache)
+
+    updated_rows = 0
+    for idx, row in df.iterrows():
+        need_pos = str(row.get("position", "")).strip() in ("", "Unknown")
+        need_h = int(row.get("height_cm", 0) or 0) == 0
+        need_b = int(row.get("birth_year", 0) or 0) == 0
+        need_nat = str(row.get("nationality", "")).strip() == ""
+
+        if not (need_pos or need_h or need_b or need_nat):
+            continue
+
+        name = str(row.get("name", "")).strip()
+        b_year = int(row.get("birth_year", 0) or 0)
+        cache_key = f"{'_'.join(_name_tokens(name))}_{b_year}"
+        info = cache.get(cache_key)
         if not info or info.get("not_found"):
             continue
 
@@ -209,10 +242,11 @@ def enrich_missing_bios_from_volleybox(df, max_new_lookups=120):
             df.at[idx, "birth_year"] = by
             df.at[idx, "age"] = datetime.now().year - by
             changed = True
+        if need_nat and info.get("nationality"):
+            df.at[idx, "nationality"] = info["nationality"]
+            changed = True
         if changed:
             updated_rows += 1
 
-    if lookups_done > 0:
-        _save_cache(cache)
-    print(f"[Volleybox] Checked {lookups_done} new players, enriched {updated_rows} profiles (cache size: {len(cache)}).")
+    print(f"[Volleybox] Checked {len(to_lookup)} new players, enriched {updated_rows} profiles across all leagues (cache: {len(cache)}).")
     return df
