@@ -25,8 +25,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+          pip install playwright
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
 
       - name: Run volleyball scraper
         run: python scraper.py
