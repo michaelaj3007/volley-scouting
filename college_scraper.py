@@ -142,7 +142,6 @@ def build_european_record(
     season = league.get("season", "2026-27")
     is_can = league["country"] == "Canada"
 
-    # European-equivalent blocks: Solo (1.0) + half of shared Block Assists (0.5 each)
     eu_blocks = int(round(bs + 0.5 * ba))
     eu_points = int(kills + aces + eu_blocks)
 
@@ -212,12 +211,11 @@ def _enrich_usports_player_page(item):
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
-        resp = session.get(url, timeout=18)
+        resp = session.get(url, timeout=15)
         if resp.status_code != 200:
             return item
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Full player name from heading (instead of abbreviated "B Drover")
         for h in soup.select("h1, h2, .player-name, [class*='player-title']"):
             txt = clean(h.get_text(" "))
             if txt and len(txt.split()) >= 2 and "u sports" not in txt.lower() and "volleyball" not in txt.lower():
@@ -242,7 +240,6 @@ def _enrich_usports_player_page(item):
             elif low in ("team", "school", "university") and not item["team"]:
                 item["team"] = val
 
-        # Check season stats table on player profile for exact Aces, Solo Blocks, Block Assists, Kills
         for tbl in soup.find_all("table"):
             ths = [clean(c.get_text(" ")).lower() for c in tbl.find_all("th")]
             if not any(h in ("s", "sp", "k", "sa", "bs", "ba") for h in ths):
@@ -292,46 +289,33 @@ def _enrich_usports_player_page(item):
 
 def scrape_usports_canada(browser, league):
     season = league.get("season", "2026-27")
-    candidate_urls = [
-        f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=full&pos=all",
-        f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
-        league.get("url"),
-    ]
-    candidate_urls = [u for i, u in enumerate(candidate_urls) if u and u not in candidate_urls[:i]]
+    url = league.get("url") or f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all"
 
     raw_items = []
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
     page = ctx.new_page()
     try:
-        for url in candidate_urls:
-            print(f"[{league['name']} ({season})] Opening {url}")
-            try:
-                resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                if resp and resp.status >= 400:
-                    continue
-                page.wait_for_selector("table", state="attached", timeout=15000)
-                page.wait_for_timeout(1500)
-            except Exception:
-                continue
+        print(f"[{league['name']} ({season})] Opening {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_selector("table tbody tr", state="attached", timeout=20000)
+        page.wait_for_timeout(1500)
 
-            soup = BeautifulSoup(page.content(), "lxml")
-            target_table = None
-            headers = []
-            for tbl in soup.find_all("table"):
-                for r in tbl.find_all("tr")[:3]:
-                    ths = [clean(c.get_text(" ")).lower() for c in r.find_all(["th", "td"])]
-                    if any("name" in h or "player" in h for h in ths) and any(
-                        h in ("k", "kills", "sp", "s", "pts", "gp") for h in ths
-                    ):
-                        target_table = tbl
-                        headers = ths
-                        break
-                if target_table:
+        soup = BeautifulSoup(page.content(), "lxml")
+        target_table = None
+        headers = []
+        for tbl in soup.find_all("table"):
+            for r in tbl.find_all("tr")[:3]:
+                ths = [clean(c.get_text(" ")).lower() for c in r.find_all(["th", "td"])]
+                if any("name" in h or "player" in h for h in ths) and any(
+                    h in ("k", "kills", "sp", "s", "pts", "gp") for h in ths
+                ):
+                    target_table = tbl
+                    headers = ths
                     break
+            if target_table:
+                break
 
-            if not target_table:
-                continue
-
+        if target_table:
             i_name = _find_col_idx(headers, ["name", "player"])
             i_team = _find_col_idx(headers, ["team", "school"])
             i_pos = _find_col_idx(headers, ["pos"])
@@ -381,13 +365,13 @@ def scrape_usports_canada(browser, league):
                     "rec_err": num(i_re),
                     "profile_url": p_url,
                 })
-            if raw_items:
-                break
+    except Exception as exc:
+        print(f"[WARN] U SPORTS error ({season}): {exc}")
     finally:
         ctx.close()
 
     if raw_items:
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        with ThreadPoolExecutor(max_workers=4) as ex:
             raw_items = [f.result() for f in as_completed([ex.submit(_enrich_usports_player_page, it) for it in raw_items])]
 
     records = [
@@ -400,7 +384,7 @@ def scrape_usports_canada(browser, league):
         )
         for it in raw_items
     ]
-    print(f"[{league['name']} ({season})] Scraped {len(records)} players with full profiles (EU-converted).")
+    print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted).")
     return records
 
 
@@ -418,11 +402,11 @@ def scrape_ncaa_mens(browser, league):
             for page_no in range(1, 5):
                 url = base_cat_url if page_no == 1 else f"{base_cat_url}/p{page_no}"
                 try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=40000)
                     if resp and resp.status >= 400:
                         break
-                    page.wait_for_selector("table", state="attached", timeout=10000)
-                    page.wait_for_timeout(800)
+                    page.wait_for_selector("table tbody tr", state="attached", timeout=15000)
+                    page.wait_for_timeout(1200)
                 except Exception:
                     break
 
