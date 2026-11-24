@@ -1,9 +1,9 @@
+import json
+import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
 from college_scraper import (
@@ -19,6 +19,39 @@ from college_scraper import (
     to_float,
     to_int,
 )
+
+CANADA_CACHE_PATH = "data/canada_usports_cache.json"
+
+
+def _load_canada_cache(season):
+    if not os.path.exists(CANADA_CACHE_PATH):
+        return []
+    try:
+        with open(CANADA_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data.get(season, [])
+    except Exception:
+        pass
+    return []
+
+
+def _save_canada_cache(season, records):
+    if not records:
+        return
+    os.makedirs(os.path.dirname(CANADA_CACHE_PATH), exist_ok=True)
+    data = {}
+    if os.path.exists(CANADA_CACHE_PATH):
+        try:
+            with open(CANADA_CACHE_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    data[season] = records
+    with open(CANADA_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _parse_usports_table(soup, base_url):
@@ -62,7 +95,7 @@ def _parse_usports_table(soup, base_url):
             cells = [clean(c.get_text(" ")) for c in tds]
             if len(cells) < 3 or i_name is None or i_name >= len(cells):
                 continue
-            name = cells[i_name]
+            name = re.sub(r"^#?\d+\s+", "", cells[i_name]).strip()
             low_n = name.lower()
             if not name or low_n in ("name", "player", "total", "totals", "team", "opponents", "opponent"):
                 continue
@@ -105,71 +138,67 @@ def _parse_usports_table(soup, base_url):
     return best_rows
 
 
-def _load_page_rows(ctx, page, url, timeout_ms=35000):
-    soup, rows = None, []
-    try:
-        resp = ctx.request.get(url, timeout=timeout_ms)
-        if resp.status == 200 and "<table" in resp.text().lower():
-            soup = BeautifulSoup(resp.text(), "lxml")
-            rows = _parse_usports_table(soup, url)
-            if rows:
-                return soup, rows
-    except Exception:
-        pass
+def _parse_usports_card_roster(soup, base_url):
+    # Fallback parser when ?view=roster renders player cards/divs instead of an HTML <table>
+    out = []
+    for a in soup.find_all("a", href=re.compile(r"/(?:players|bios)/", re.IGNORECASE)):
+        name = re.sub(r"^#?\d+\s+", "", clean(a.get_text(" "))).strip()
+        if not name or len(name.split()) < 2:
+            continue
+        p_url = urljoin(base_url, a["href"])
+        box = a.find_parent(["li", "tr", "article", "div"])
+        txt = clean(box.get_text(" | ")) if box else ""
 
+        pos, yr, ht = "", "", ""
+        m_ht = re.search(r"\b([5-7]\s*[-'′]\s*\d{1,2}|[12][.,]\d{2}\s*m?|(?:1[6-9]\d|2[0-2]\d)\s*cm)\b", txt, re.IGNORECASE)
+        if m_ht:
+            ht = m_ht.group(1)
+
+        m_yr = re.search(r"(?:Yr\.?|Year|Elig\.?)\s*[:\-]?\s*([1-5](?:st|nd|rd|th)?)|\b([1-5](?:st|nd|rd|th))\b", txt, re.IGNORECASE)
+        if m_yr:
+            yr = m_yr.group(1) or m_yr.group(2)
+
+        for tok in re.split(r"[|/,]", txt):
+            t_clean = tok.strip().lower().replace(".", "")
+            if t_clean in ("oh", "mb", "mh", "s", "opp", "rs", "l", "libero", "setter", "middle", "outside", "opposite"):
+                pos = tok.strip()
+                break
+
+        out.append({
+            "name": name,
+            "slug": _player_slug_from_href(p_url),
+            "team": "",
+            "team_url": "",
+            "pos": pos,
+            "yr": yr,
+            "ht": ht,
+            "gp": 0, "sp": 0, "k": 0, "e": 0, "ta": 0, "pct": 0.0,
+            "sa": 0, "se": 0, "re": 0, "bs": 0, "ba": 0, "btot": 0.0, "pts": 0.0,
+            "ast": 0, "dig": 0,
+            "profile_url": p_url,
+        })
+    return out
+
+
+def _goto_and_parse(page, url, timeout_ms=35000, allow_card_roster=False):
+    soup, rows = None, []
     try:
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if resp and resp.status >= 400:
+            print(f"[DEBUG][CANADA] HTTP {resp.status} on {url}")
             return soup, []
-        page.wait_for_selector("table", state="attached", timeout=18000)
-        page.wait_for_timeout(1500)
+        try:
+            page.wait_for_selector("table", state="attached", timeout=12000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1200)
         soup = BeautifulSoup(page.content(), "lxml")
         rows = _parse_usports_table(soup, url)
-    except Exception:
-        pass
+        if not rows and allow_card_roster:
+            rows = _parse_usports_card_roster(soup, url)
+    except Exception as exc:
+        print(f"[DEBUG][CANADA] Load note on {url}: {exc}")
     return soup, rows
-
-
-def _enrich_single_usports_bio(p):
-    # Fallback: read individual U SPORTS player page if Yr / Ht / Full Name is still missing
-    url = p.get("profile_url", "")
-    if not url or ("/players/" not in url.lower() and "/bios/" not in url.lower()):
-        return p
-    if p["yr"] and p["ht"] and not re.match(r"^[A-Z]\.?\s+", p["name"]):
-        return p
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            return p
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        for h in soup.select("h1, h2, .player-name, [class*='player-title']"):
-            txt = re.sub(r"^#?\d+\s+", "", clean(h.get_text(" "))).strip()
-            if txt and len(txt.split()) >= 2 and "u sports" not in txt.lower() and "volleyball" not in txt.lower():
-                if re.match(r"^[A-Z]\.?\s+", p["name"]) or len(txt) > len(p["name"]):
-                    p["name"] = txt
-                break
-
-        lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
-        for i, line in enumerate(lines):
-            low = line.rstrip(":").lower()
-            nxt = lines[i + 1] if i + 1 < len(lines) else ""
-            same = line.split(":", 1)[1].strip() if ":" in line else ""
-            val = same or nxt
-            if not val:
-                continue
-            if low in ("year", "yr", "class", "eligibility", "academic year") and not p["yr"]:
-                p["yr"] = val
-            elif low in ("height", "ht") and not p["ht"]:
-                p["ht"] = val
-            elif low in ("position", "pos") and not p["pos"]:
-                p["pos"] = val
-    except Exception:
-        pass
-    return p
 
 
 def scrape_canada_usports(browser, league):
@@ -248,7 +277,8 @@ def scrape_canada_usports(browser, league):
         soup_main = None
         for m_url in main_candidates:
             print(f"[{league['name']} ({season})] Opening {m_url}")
-            soup_main, rows_main = _load_page_rows(ctx, page, m_url, timeout_ms=40000)
+            soup_main, rows_main = _goto_and_parse(page, m_url, timeout_ms=40000)
+            print(f"[DEBUG][CANADA {season}] {m_url} -> {len(rows_main)} players")
             if rows_main:
                 for r in rows_main:
                     upsert_player(r)
@@ -262,40 +292,28 @@ def scrape_canada_usports(browser, league):
                 bt = urljoin("https://en.usports.ca/", a["href"]).split("?")[0].rstrip("/")
                 team_urls.setdefault(bt, clean(a.get_text(" ")))
 
-        soup_t, _ = _load_page_rows(ctx, page, teams_index_url, timeout_ms=25000)
-        if soup_t:
-            for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
-                bt = urljoin(teams_index_url, a["href"]).split("?")[0].rstrip("/")
-                lbl = clean(a.get_text(" "))
-                if bt not in team_urls or (lbl and not team_urls[bt]):
-                    team_urls[bt] = lbl
+        if not team_urls:
+            soup_t, _ = _goto_and_parse(page, teams_index_url, timeout_ms=25000)
+            if soup_t:
+                for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
+                    bt = urljoin(teams_index_url, a["href"]).split("?")[0].rstrip("/")
+                    lbl = clean(a.get_text(" "))
+                    if bt not in team_urls or (lbl and not team_urls[bt]):
+                        team_urls[bt] = lbl
 
+        print(f"[DEBUG][CANADA {season}] Found {len(team_urls)} teams. Reading rosters for Yr/Pos/Ht/Full Name...")
         for t_url, t_name in list(team_urls.items()):
-            time.sleep(0.2)
-            soup_r, rows_r = _load_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
+            time.sleep(0.4)
+            soup_r, rows_r = _goto_and_parse(page, f"{t_url}?view=roster", timeout_ms=20000, allow_card_roster=True)
             if soup_r and not t_name and soup_r.find("h1"):
                 t_name = clean(soup_r.find("h1").get_text(" "))
             for r in rows_r:
                 upsert_player(r, default_team=t_name, is_roster=True)
 
-            time.sleep(0.2)
-            _, rows_ts = _load_page_rows(ctx, page, f"{t_url}?view=lineup", timeout_ms=20000)
-            for r in rows_ts:
-                upsert_player(r, default_team=t_name, is_roster=False)
-
-        active_players = [
-            p for p in merged.values()
-            if p["sp"] > 0 or p["pts"] > 0 or p["k"] > 0
-        ]
-
-        # Fill any remaining missing Yr / Ht / Full Name directly from player profile pages
-        need_bio = [p for p in active_players if not p["yr"] or not p["ht"] or re.match(r"^[A-Z]\.?\s+", p["name"])]
-        if need_bio:
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                list(as_completed([ex.submit(_enrich_single_usports_bio, p) for p in need_bio]))
-
         stat_hints = {}
-        for p in active_players:
+        for p in merged.values():
+            if p["sp"] == 0 and p["pts"] == 0 and p["k"] == 0:
+                continue
             rec = build_european_record(
                 league=league, name=p["name"], team=p["team"], pos_raw=p["pos"],
                 class_raw=p["yr"], height_raw=p["ht"], matches=p["gp"], sets=p["sp"],
@@ -307,11 +325,21 @@ def scrape_canada_usports(browser, league):
             stat_hints[rec["player_id"]] = {"assists": p["ast"], "digs": p["dig"]}
             records.append(rec)
 
-        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=200)
-        grad_cnt = sum(1 for r in records if r["grad_2027"])
-        print(f"[{league['name']} ({season})] Scraped {len(records)} Canadian players ({grad_cnt} graduating Summer 2027).")
+        if records:
+            records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=200)
+            _save_canada_cache(season, records)
+            grad_cnt = sum(1 for r in records if r["grad_2027"])
+            print(f"[{league['name']} ({season})] Scraped & cached {len(records)} Canadian players ({grad_cnt} graduating Summer 2027).")
+        else:
+            cached = _load_canada_cache(season)
+            if cached:
+                records = _enrich_college_records_from_vb(cached, max_new=200)
+                print(f"[{league['name']} ({season})] Loaded {len(records)} Canadian players from local cache.")
     except Exception as exc:
         print(f"[WARN] Canada U SPORTS error ({season}): {exc}")
+        cached = _load_canada_cache(season)
+        if cached:
+            records = cached
     finally:
         ctx.close()
 
