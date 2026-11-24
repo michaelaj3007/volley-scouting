@@ -1,7 +1,9 @@
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup
 
 from college_scraper import (
@@ -34,7 +36,7 @@ def _parse_usports_table(soup, base_url):
         i_name = _find_col_idx(headers, ["name", "player"])
         i_team = _find_col_idx(headers, ["team", "school"])
         i_pos = _find_col_idx(headers, ["pos", "position"])
-        i_yr = _find_col_idx(headers, ["yr", "year", "cl", "class", "elig"])
+        i_yr = _find_col_idx(headers, ["yr", "year", "cl", "class", "elig", "eligibility"])
         i_ht = _find_col_idx(headers, ["ht", "height"])
         i_gp = _find_col_idx(headers, ["gp", "mp", "m"])
         i_sp = _find_col_idx(headers, ["sp", "s", "sets"])
@@ -65,7 +67,7 @@ def _parse_usports_table(soup, base_url):
             if not name or low_n in ("name", "player", "total", "totals", "team", "opponents", "opponent"):
                 continue
 
-            a_el = tds[i_name].find("a", href=True) or tr.find("a", href=re.compile(r"/players/", re.IGNORECASE))
+            a_el = tds[i_name].find("a", href=True) or tr.find("a", href=re.compile(r"/(?:players|bios)/", re.IGNORECASE))
             p_url = urljoin(base_url, a_el["href"]) if a_el else base_url
             team_a = tr.find("a", href=re.compile(r"/teams/", re.IGNORECASE))
 
@@ -118,15 +120,56 @@ def _load_page_rows(ctx, page, url, timeout_ms=35000):
     try:
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if resp and resp.status >= 400:
-            print(f"[DEBUG][CANADA] HTTP {resp.status} on {url}")
             return soup, []
         page.wait_for_selector("table", state="attached", timeout=18000)
         page.wait_for_timeout(1500)
         soup = BeautifulSoup(page.content(), "lxml")
         rows = _parse_usports_table(soup, url)
-    except Exception as exc:
-        print(f"[DEBUG][CANADA] Note on {url}: {exc}")
+    except Exception:
+        pass
     return soup, rows
+
+
+def _enrich_single_usports_bio(p):
+    # Fallback: read individual U SPORTS player page if Yr / Ht / Full Name is still missing
+    url = p.get("profile_url", "")
+    if not url or ("/players/" not in url.lower() and "/bios/" not in url.lower()):
+        return p
+    if p["yr"] and p["ht"] and not re.match(r"^[A-Z]\.?\s+", p["name"]):
+        return p
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    try:
+        resp = session.get(url, timeout=15)
+        if resp.status_code != 200:
+            return p
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        for h in soup.select("h1, h2, .player-name, [class*='player-title']"):
+            txt = re.sub(r"^#?\d+\s+", "", clean(h.get_text(" "))).strip()
+            if txt and len(txt.split()) >= 2 and "u sports" not in txt.lower() and "volleyball" not in txt.lower():
+                if re.match(r"^[A-Z]\.?\s+", p["name"]) or len(txt) > len(p["name"]):
+                    p["name"] = txt
+                break
+
+        lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
+        for i, line in enumerate(lines):
+            low = line.rstrip(":").lower()
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            same = line.split(":", 1)[1].strip() if ":" in line else ""
+            val = same or nxt
+            if not val:
+                continue
+            if low in ("year", "yr", "class", "eligibility", "academic year") and not p["yr"]:
+                p["yr"] = val
+            elif low in ("height", "ht") and not p["ht"]:
+                p["ht"] = val
+            elif low in ("position", "pos") and not p["pos"]:
+                p["pos"] = val
+    except Exception:
+        pass
+    return p
 
 
 def scrape_canada_usports(browser, league):
@@ -135,7 +178,6 @@ def scrape_canada_usports(browser, league):
         league.get("url"),
         f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
         f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&pos=all",
-        f"https://universitysport.prestosports.com/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
     ]
     main_candidates = [u for i, u in enumerate(main_candidates) if u and u not in main_candidates[:i]]
     teams_index_url = f"https://en.usports.ca/sports/mvball/{season}/teams"
@@ -144,16 +186,32 @@ def scrape_canada_usports(browser, league):
     page = ctx.new_page()
     merged, alias_to_key, team_urls = {}, {}, {}
 
+    def _alias_keys(name, team_name):
+        keys = []
+        if team_name:
+            k_full = _initial_surname_key(name, team_name)
+            if k_full:
+                keys.append(k_full)
+            first_word = team_name.split()[0]
+            k_short = _initial_surname_key(name, first_word)
+            if k_short and k_short not in keys:
+                keys.append(k_short)
+        return keys
+
     def upsert_player(row, default_team="", is_roster=False):
         team_name = row["team"] or default_team
         slug = row["slug"]
-        isk = _initial_surname_key(row["name"], team_name)
+        akeys = _alias_keys(row["name"], team_name)
 
+        key = None
         if slug and slug in merged:
             key = slug
-        elif isk and isk in alias_to_key:
-            key = alias_to_key[isk]
         else:
+            for ak in akeys:
+                if ak in alias_to_key:
+                    key = alias_to_key[ak]
+                    break
+        if not key:
             key = slug or f"{slugify(row['name'])}_{slugify(team_name)}"
 
         if key not in merged:
@@ -164,8 +222,8 @@ def scrape_canada_usports(browser, league):
                 "ast": 0, "dig": 0,
                 "profile_url": row["profile_url"],
             }
-        if isk:
-            alias_to_key.setdefault(isk, key)
+        for ak in akeys:
+            alias_to_key.setdefault(ak, key)
 
         cur = merged[key]
         is_abbrev = bool(re.match(r"^[A-Z]\.?\s+", row["name"]))
@@ -191,7 +249,6 @@ def scrape_canada_usports(browser, league):
         for m_url in main_candidates:
             print(f"[{league['name']} ({season})] Opening {m_url}")
             soup_main, rows_main = _load_page_rows(ctx, page, m_url, timeout_ms=40000)
-            print(f"[DEBUG][CANADA {season}] {m_url} -> {len(rows_main)} rows")
             if rows_main:
                 for r in rows_main:
                     upsert_player(r)
@@ -213,7 +270,6 @@ def scrape_canada_usports(browser, league):
                 if bt not in team_urls or (lbl and not team_urls[bt]):
                     team_urls[bt] = lbl
 
-        print(f"[DEBUG][CANADA {season}] Found {len(team_urls)} teams. Reading rosters & stats...")
         for t_url, t_name in list(team_urls.items()):
             time.sleep(0.2)
             soup_r, rows_r = _load_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
@@ -227,10 +283,19 @@ def scrape_canada_usports(browser, league):
             for r in rows_ts:
                 upsert_player(r, default_team=t_name, is_roster=False)
 
+        active_players = [
+            p for p in merged.values()
+            if p["sp"] > 0 or p["pts"] > 0 or p["k"] > 0
+        ]
+
+        # Fill any remaining missing Yr / Ht / Full Name directly from player profile pages
+        need_bio = [p for p in active_players if not p["yr"] or not p["ht"] or re.match(r"^[A-Z]\.?\s+", p["name"])]
+        if need_bio:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(as_completed([ex.submit(_enrich_single_usports_bio, p) for p in need_bio]))
+
         stat_hints = {}
-        for p in merged.values():
-            if p["sp"] == 0 and p["pts"] == 0 and p["k"] == 0:
-                continue
+        for p in active_players:
             rec = build_european_record(
                 league=league, name=p["name"], team=p["team"], pos_raw=p["pos"],
                 class_raw=p["yr"], height_raw=p["ht"], matches=p["gp"], sets=p["sp"],
@@ -242,7 +307,7 @@ def scrape_canada_usports(browser, league):
             stat_hints[rec["player_id"]] = {"assists": p["ast"], "digs": p["dig"]}
             records.append(rec)
 
-        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=150)
+        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=200)
         grad_cnt = sum(1 for r in records if r["grad_2027"])
         print(f"[{league['name']} ({season})] Scraped {len(records)} Canadian players ({grad_cnt} graduating Summer 2027).")
     except Exception as exc:
