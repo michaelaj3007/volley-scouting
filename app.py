@@ -6,14 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from crm_manager import load_crm_data, load_logo_assets, save_crm_data
-from i18n import (
-    AGENT_OPTIONS,
-    CONTACT_STATUSES,
-    POS_OPTIONS,
-    label_agent,
-    label_contact,
-    t,
-)
+from i18n import AGENT_OPTIONS, CONTACT_STATUSES, POS_OPTIONS, label_agent, label_contact, t
 
 st.set_page_config(page_title="MSA Volley Scouting", page_icon="🏐", layout="wide")
 
@@ -30,12 +23,9 @@ def lang_selector(key_name):
     opts = ["el", "en"]
     cur = st.session_state.get("lang", "el")
     picked = st.selectbox(
-        "Language",
-        opts,
-        index=opts.index(cur),
+        "Language", opts, index=opts.index(cur),
         format_func=lambda c: "🇬🇷 Ελληνικά" if c == "el" else "🇬🇧 English",
-        label_visibility="collapsed",
-        key=key_name,
+        label_visibility="collapsed", key=key_name,
     )
     if picked != cur:
         st.session_state["lang"] = picked
@@ -86,8 +76,7 @@ def persist_crm(success_msg=None):
         st.session_state["crm_status"] = "connected"
         st.session_state["flash_msg"] = ("success", success_msg or t(lang, "saved_ok"))
     else:
-        err_txt = t(lang, "err_no_token") if "GITHUB_TOKEN" in msg else msg
-        st.session_state["flash_msg"] = ("warning", err_txt)
+        st.session_state["flash_msg"] = ("warning", t(lang, "err_no_token") if "GITHUB_TOKEN" in msg else msg)
 
 
 @st.cache_data(ttl=300)
@@ -111,9 +100,17 @@ def load_base_players():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    if "season" not in df.columns:
+        df["season"] = "2026-27"
+    if "grad_status" not in df.columns:
+        df["grad_status"] = ""
+    if "grad_2027" not in df.columns:
+        df["grad_2027"] = False
+    df["grad_2027"] = df["grad_2027"].fillna(False).astype(bool)
+
     for col in [
-        "player_id", "name", "team", "league", "country", "gender",
-        "position", "nationality", "profile_url", "photo_url",
+        "player_id", "season", "name", "team", "league", "country", "gender",
+        "position", "grad_status", "nationality", "profile_url", "photo_url",
     ]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
@@ -259,6 +256,10 @@ st.sidebar.header(t(lang, "sidebar_title"))
 
 search_q = st.sidebar.text_input(t(lang, "search_lbl"), placeholder=t(lang, "search_ph"))
 only_clients = st.sidebar.checkbox(t(lang, "only_clients"), value=False)
+only_grad27 = st.sidebar.checkbox(t(lang, "only_grad27"), value=False)
+
+seasons_opt = sorted([x for x in df["season"].unique() if x], reverse=True)
+sel_seasons = st.sidebar.multiselect(t(lang, "filter_season"), seasons_opt, default=seasons_opt)
 
 all_shortlists = crm.get("shortlists", [])
 sel_shortlist = st.sidebar.selectbox(
@@ -295,6 +296,10 @@ min_sets = st.sidebar.number_input(t(lang, "min_sets"), 0, 200, 0)
 fdf = df.copy()
 if only_clients:
     fdf = fdf[fdf["is_our_client"]]
+if only_grad27:
+    fdf = fdf[fdf["grad_2027"]]
+if sel_seasons:
+    fdf = fdf[fdf["season"].isin(sel_seasons)]
 if sel_shortlist:
     fdf = fdf[fdf["shortlists_list"].apply(lambda lst: sel_shortlist in lst)]
 if sel_contact:
@@ -329,9 +334,11 @@ k4.metric(t(lang, "kpi_blocker"), f"{int(fdf['blocks'].max())} {t(lang, 'blk_uni
 
 COMMON_CFG = {
     "name": st.column_config.TextColumn(t(lang, "col_name"), width="medium"),
+    "season": st.column_config.TextColumn(t(lang, "col_season"), width="small"),
     "team": st.column_config.TextColumn(t(lang, "col_team"), width="medium"),
     "league": t(lang, "col_league"),
     "position": st.column_config.TextColumn(t(lang, "col_pos"), width="small"),
+    "grad_status": st.column_config.TextColumn(t(lang, "col_grad"), width="medium"),
     "height_cm": st.column_config.NumberColumn(t(lang, "col_height"), format="%d cm", width="small"),
     "age": st.column_config.NumberColumn(t(lang, "col_age"), format="%d", width="small"),
     "nationality": t(lang, "col_nat"),
@@ -374,8 +381,7 @@ with tab_leaders:
     top_n = c1.slider(t(lang, "lb_top_n"), 5, 30, 10)
     lb_min_sets = c2.number_input(t(lang, "lb_min_sets"), 1, 100, 3)
     rank_mode = c3.radio(
-        t(lang, "lb_sort"),
-        ["per_set", "total"],
+        t(lang, "lb_sort"), ["per_set", "total"],
         format_func=lambda x: t(lang, "rank_per_set") if x == "per_set" else t(lang, "rank_total"),
         horizontal=True,
     )
@@ -386,7 +392,7 @@ with tab_leaders:
     else:
         def show_board(title, data, sort_col, stat_cols):
             st.markdown(f"### {title}")
-            cols = ["name"] + stat_cols + ["team", "position", "height_cm", "age", "sets"]
+            cols = ["name"] + stat_cols + ["team", "season", "position", "height_cm", "age", "grad_status", "sets"]
             top_df = data.sort_values(by=sort_col, ascending=False).head(top_n)
             render_styled_table(top_df, cols, COMMON_CFG, rank_index=True)
 
@@ -417,7 +423,7 @@ with tab_db:
         elif not fdf.empty:
             qc1, qc2, qc3 = st.columns([3, 2, 1.2])
             s_fdf = fdf.sort_values("name").reset_index(drop=True)
-            lbl_to_pid = {f"{r['name']} — {r['team']} ({r['league']})": r["player_id"] for _, r in s_fdf.iterrows()}
+            lbl_to_pid = {f"{r['name']} — {r['team']} ({r['league']} {r['season']})": r["player_id"] for _, r in s_fdf.iterrows()}
             picked_lbls = qc1.multiselect(t(lang, "pick_players"), list(lbl_to_pid.keys()), key="quick_pick")
             target_sl = qc2.selectbox(t(lang, "which_sl"), all_shortlists, key="quick_sl")
             if qc3.button(t(lang, "btn_add"), type="primary", width="stretch", key="quick_add_btn"):
@@ -433,8 +439,8 @@ with tab_db:
                     st.rerun()
 
     db_cols = [
-        "name", "team", "league", "position", "height_cm", "age", "nationality",
-        "sets", "points", "points_per_set", "aces", "blocks", "attack_pct", "reception_pos_pct",
+        "name", "season", "team", "league", "position", "grad_status", "height_cm", "age", "nationality",
+        "sets", "points", "points_per_set", "aces", "blocks", "attack_pct", "attack_eff_pct", "reception_pos_pct",
         "contact_display", "agent_name", "shortlists_str", "notes", "profile_url",
     ]
     if fdf.empty:
@@ -449,7 +455,7 @@ with tab_card:
         st.info(t(lang, "no_players_filters"))
     else:
         sorted_fdf = fdf.sort_values("name").reset_index(drop=True)
-        options = [f"{'⭐ ' if r['is_our_client'] else ''}{r['name']} — {r['team']}" for _, r in sorted_fdf.iterrows()]
+        options = [f"{'⭐ ' if r['is_our_client'] else ''}{r['name']} — {r['team']} ({r['season']})" for _, r in sorted_fdf.iterrows()]
         chosen = st.selectbox(t(lang, "pick_player"), options, key="card_select")
         p = sorted_fdf.iloc[options.index(chosen)]
         pid = p["player_id"]
@@ -461,8 +467,10 @@ with tab_card:
             if p["is_our_client"]:
                 st.success(t(lang, "badge_our_client"))
             st.markdown(f"**{t(lang, 'lbl_team')}:** {p['team']}")
-            st.markdown(f"**{t(lang, 'lbl_league')}:** {p['league']}")
+            st.markdown(f"**{t(lang, 'lbl_league')}:** {p['league']} ({p['season']})")
             st.markdown(f"**{t(lang, 'lbl_pos')}:** {p['position']}")
+            if p["grad_status"]:
+                st.markdown(f"**{t(lang, 'lbl_grad')}:** {p['grad_status']}")
             st.markdown(f"**{t(lang, 'lbl_height')}:** {int(p['height_cm'])} cm" if p["height_cm"] > 0 else f"**{t(lang, 'lbl_height')}:** —")
             st.markdown(f"**{t(lang, 'lbl_age')}:** {int(p['age'])} ({int(p['birth_year'])})" if p["age"] > 0 else f"**{t(lang, 'lbl_age')}:** —")
             st.markdown(f"**{t(lang, 'lbl_nat')}:** {p['nationality']}")
@@ -491,12 +499,7 @@ with tab_card:
                 f1, f2 = st.columns(2)
                 is_client_val = f1.checkbox(t(lang, "crm_is_client"), value=bool(existing.get("is_our_client", False)))
                 c_stat_idx = CONTACT_STATUSES.index(existing["contact_status"]) if existing.get("contact_status") in CONTACT_STATUSES else 0
-                contact_val = f2.selectbox(
-                    t(lang, "crm_contact_status"),
-                    CONTACT_STATUSES,
-                    index=c_stat_idx,
-                    format_func=lambda x: label_contact(x, lang),
-                )
+                contact_val = f2.selectbox(t(lang, "crm_contact_status"), CONTACT_STATUSES, index=c_stat_idx, format_func=lambda x: label_contact(x, lang))
 
                 s1, s2 = st.columns([2, 1.2])
                 sel_sls = s1.multiselect(t(lang, "crm_add_sl"), all_shortlists, default=cur_sls)
@@ -509,12 +512,7 @@ with tab_card:
 
                 ag1, ag2, ag3 = st.columns(3)
                 ag_idx = AGENT_OPTIONS.index(existing["has_agent"]) if existing.get("has_agent") in AGENT_OPTIONS else 0
-                has_ag_val = ag1.selectbox(
-                    t(lang, "crm_has_agent"),
-                    AGENT_OPTIONS,
-                    index=ag_idx,
-                    format_func=lambda x: label_agent(x, lang),
-                )
+                has_ag_val = ag1.selectbox(t(lang, "crm_has_agent"), AGENT_OPTIONS, index=ag_idx, format_func=lambda x: label_agent(x, lang))
                 ag_name_val = ag2.text_input(t(lang, "crm_agent_name"), value=existing.get("agent_name", ""))
                 contract_val = ag3.text_input(t(lang, "crm_contract"), value=existing.get("contract_until", ""), placeholder=t(lang, "crm_contract_ph"))
 
@@ -522,12 +520,7 @@ with tab_card:
                 h_ov_val = ov1.number_input(t(lang, "crm_height_ov"), 0, 235, int(existing.get("height_cm", 0) or 0))
                 pos_cur = existing.get("position", "")
                 pos_choices = [""] + POS_OPTIONS
-                pos_ov_val = ov2.selectbox(
-                    t(lang, "crm_pos_ov"),
-                    pos_choices,
-                    index=pos_choices.index(pos_cur) if pos_cur in POS_OPTIONS else 0,
-                    format_func=lambda x: t(lang, "auto_opt") if x == "" else x,
-                )
+                pos_ov_val = ov2.selectbox(t(lang, "crm_pos_ov"), pos_choices, index=pos_choices.index(pos_cur) if pos_cur in POS_OPTIONS else 0, format_func=lambda x: t(lang, "auto_opt") if x == "" else x)
 
                 notes_val = st.text_area(t(lang, "crm_notes"), value=existing.get("notes", ""), height=90)
 
@@ -541,30 +534,17 @@ with tab_card:
                             final_sls.append(ns)
 
                     crm["players"][pid] = {
-                        "name": p["name"],
-                        "is_our_client": is_client_val,
-                        "contact_status": contact_val,
-                        "shortlists": final_sls,
-                        "phone": phone_val.strip(),
-                        "email": email_val.strip(),
-                        "social": social_val.strip(),
-                        "has_agent": has_ag_val,
-                        "agent_name": ag_name_val.strip(),
-                        "contract_until": contract_val.strip(),
-                        "height_cm": int(h_ov_val),
-                        "position": pos_ov_val,
-                        "notes": notes_val.strip(),
-                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "name": p["name"], "is_our_client": is_client_val, "contact_status": contact_val,
+                        "shortlists": final_sls, "phone": phone_val.strip(), "email": email_val.strip(),
+                        "social": social_val.strip(), "has_agent": has_ag_val, "agent_name": ag_name_val.strip(),
+                        "contract_until": contract_val.strip(), "height_cm": int(h_ov_val), "position": pos_ov_val,
+                        "notes": notes_val.strip(), "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     }
                     persist_crm(t(lang, "msg_saved_player", name=p["name"]))
                     st.rerun()
 
 with tab_crm:
-    sub_sl, sub_ours, sub_pipe = st.tabs([
-        t(lang, "sub_sl"),
-        t(lang, "sub_ours"),
-        t(lang, "sub_pipe"),
-    ])
+    sub_sl, sub_ours, sub_pipe = st.tabs([t(lang, "sub_sl"), t(lang, "sub_ours"), t(lang, "sub_pipe")])
 
     with sub_sl:
         mc1, mc2, _ = st.columns([2.5, 1, 2])
@@ -594,14 +574,14 @@ with tab_crm:
                 st.info(t(lang, "sl_empty"))
             else:
                 sl_cols = [
-                    "name", "team", "league", "position", "height_cm", "age",
+                    "name", "season", "team", "league", "position", "grad_status", "height_cm", "age",
                     "sets", "points_per_set", "aces_per_set", "blocks_per_set", "attack_pct",
                     "contact_display", "agent_name", "contract_until", "notes", "profile_url",
                 ]
                 render_styled_table(sl_df, sl_cols, COMMON_CFG)
 
                 rc1, rc2 = st.columns([3, 1.2])
-                rem_map = {f"{r['name']} — {r['team']}": r["player_id"] for _, r in sl_df.iterrows()}
+                rem_map = {f"{r['name']} — {r['team']} ({r['season']})": r["player_id"] for _, r in sl_df.iterrows()}
                 rem_pick = rc1.selectbox(t(lang, "rem_from_sl"), list(rem_map.keys()), key="rem_sl_pick")
                 if rc2.button(t(lang, "btn_remove"), width="stretch", key="rem_sl_btn"):
                     rpid = rem_map[rem_pick]
@@ -622,7 +602,7 @@ with tab_crm:
             st.info(t(lang, "no_ours_yet"))
         else:
             ours_cols = [
-                "name", "team", "league", "position", "height_cm", "age",
+                "name", "season", "team", "league", "position", "height_cm", "age",
                 "sets", "points", "points_per_set", "aces", "blocks", "attack_pct",
                 "contract_until", "notes", "profile_url",
             ]
@@ -634,7 +614,7 @@ with tab_crm:
             st.info(t(lang, "no_pipe_yet"))
         else:
             pipe_cols = [
-                "name", "team", "league", "position", "contact_display",
+                "name", "season", "team", "league", "position", "contact_display",
                 "phone", "email", "social", "agent_display", "agent_name", "contract_until", "shortlists_str", "notes",
             ]
             render_styled_table(pipe_df, pipe_cols, COMMON_CFG)
