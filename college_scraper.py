@@ -188,7 +188,6 @@ def _parse_vb_page(html_text):
     soup = BeautifulSoup(html_text, "lxml")
     pos, height_cm, birth_year, nationality = "", 0, 0, ""
 
-    # Check structured <dt>/<dd> and <tr>/<td> pairs first
     for dt in soup.find_all(["dt", "th", "td"]):
         lbl = clean(dt.get_text(" ")).rstrip(":").lower()
         sib = dt.find_next_sibling(["dd", "td"])
@@ -347,7 +346,6 @@ def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
             if not r["nationality"] and info.get("nationality"):
                 r["nationality"] = info["nationality"]
 
-        # Fallback: infer role from NCAA stat profile if still Unknown
         if r["position"] == "Unknown" and stat_hints:
             h = stat_hints.get(r["player_id"], {})
             inferred = _infer_position_from_stats(
@@ -488,6 +486,8 @@ def _parse_usports_table(soup, base_url):
         i_ba = _find_col_idx(headers, ["ba", "block assists"])
         i_btot = _find_col_idx(headers, ["b", "blk", "tb", "tot", "total blocks"])
         i_pts = _find_col_idx(headers, ["pts", "points"])
+        i_ast = _find_col_idx(headers, ["a", "ast", "assists"])
+        i_dig = _find_col_idx(headers, ["d", "dig", "digs"])
 
         rows_out = []
         for tr in tbl.find_all("tr"):
@@ -517,6 +517,7 @@ def _parse_usports_table(soup, base_url):
                 "gp": gi(i_gp), "sp": gi(i_sp), "k": gi(i_k), "e": gi(i_e), "ta": gi(i_ta),
                 "pct": gf(i_pct), "sa": gi(i_sa), "se": gi(i_se), "re": gi(i_re),
                 "bs": gi(i_bs), "ba": gi(i_ba), "btot": gf(i_btot), "pts": gf(i_pts),
+                "ast": gi(i_ast), "dig": gi(i_dig),
                 "profile_url": p_url,
             })
         if len(rows_out) > len(best_rows):
@@ -526,15 +527,6 @@ def _parse_usports_table(soup, base_url):
 
 def _fetch_usports_page_rows(ctx, page, url, timeout_ms=30000):
     soup, rows = None, []
-    try:
-        resp = ctx.request.get(url, timeout=timeout_ms)
-        if resp.status == 200:
-            soup = BeautifulSoup(resp.text(), "lxml")
-            rows = _parse_usports_table(soup, url)
-            if rows:
-                return soup, rows
-    except Exception:
-        pass
     try:
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if resp and resp.status >= 400:
@@ -550,12 +542,7 @@ def _fetch_usports_page_rows(ctx, page, url, timeout_ms=30000):
 
 def scrape_usports_canada(browser, league):
     season = league.get("season", "2026-27")
-    stat_urls = [
-        ("offense", f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&pos=of&r=0"),
-        ("offense_q", f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=of"),
-        ("defense", f"https://en.usports.ca/sports/mvball/{season}/players?sort=b&pos=df&r=0"),
-        ("serve_rec", f"https://en.usports.ca/sports/mvball/{season}/players?sort=sa&pos=sr&r=0"),
-    ]
+    main_url = league.get("url") or f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all"
     teams_index_url = f"https://en.usports.ca/sports/mvball/{season}/teams"
 
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
@@ -573,6 +560,7 @@ def scrape_usports_canada(browser, league):
                 "name": row["name"], "team": team_name, "pos": "", "yr": "", "ht": "",
                 "gp": 0, "sp": 0, "k": 0, "e": 0, "ta": 0, "pct": 0.0,
                 "sa": 0, "se": 0, "re": 0, "bs": 0, "ba": 0, "btot": 0.0, "pts": 0.0,
+                "ast": 0, "dig": 0,
                 "profile_url": row["profile_url"],
             }
         if isk:
@@ -591,25 +579,41 @@ def scrape_usports_canada(browser, league):
             cur["team"] = team_name
         if "/players/" in row["profile_url"]:
             cur["profile_url"] = row["profile_url"]
-        for fld in ("gp", "sp", "k", "e", "ta", "sa", "se", "re", "bs", "ba", "btot", "pts"):
+        for fld in ("gp", "sp", "k", "e", "ta", "sa", "se", "re", "bs", "ba", "btot", "pts", "ast", "dig"):
             cur[fld] = max(cur[fld], row[fld])
         if row["pct"] != 0.0:
             cur["pct"] = row["pct"]
 
     try:
-        for label, s_url in stat_urls:
-            soup_s, rows_s = _fetch_usports_page_rows(ctx, page, s_url, timeout_ms=35000)
-            print(f"[DEBUG][USPORTS {season}] {label}: {len(rows_s)} rows")
-            for r in rows_s:
-                upsert_player(r)
-                if r["team_url"]:
-                    bt = r["team_url"].split("?")[0].rstrip("/")
-                    team_urls[bt] = r["team"] or team_urls.get(bt, "")
-            if soup_s:
-                for a in soup_s.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
-                    bt = urljoin(s_url, a["href"]).split("?")[0].rstrip("/")
-                    team_urls.setdefault(bt, clean(a.get_text(" ")))
+        # 1) Load the working pos=all leaderboard URL first
+        print(f"[{league['name']} ({season})] Opening {main_url}")
+        soup_main, rows_main = _fetch_usports_page_rows(ctx, page, main_url, timeout_ms=40000)
+        print(f"[DEBUG][USPORTS {season}] main (pos=all): {len(rows_main)} rows")
+        for r in rows_main:
+            upsert_player(r)
+            if r["team_url"]:
+                bt = r["team_url"].split("?")[0].rstrip("/")
+                team_urls[bt] = r["team"] or team_urls.get(bt, "")
 
+        # Discover any additional stat category links from the page's own tabs/selects
+        extra_stat_links = []
+        if soup_main:
+            for a in soup_main.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
+                bt = urljoin(main_url, a["href"]).split("?")[0].rstrip("/")
+                team_urls.setdefault(bt, clean(a.get_text(" ")))
+            for el in soup_main.find_all(["a", "option"]):
+                ref = clean(el.get("href") or el.get("value"))
+                if f"/sports/mvball/{season}/players" in ref and ("pos=" in ref or "sort=" in ref):
+                    full_l = urljoin(main_url, ref)
+                    if full_l != main_url and full_l not in extra_stat_links:
+                        extra_stat_links.append(full_l)
+
+        for ex_url in extra_stat_links[:4]:
+            _, rows_ex = _fetch_usports_page_rows(ctx, page, ex_url, timeout_ms=25000)
+            for r in rows_ex:
+                upsert_player(r)
+
+        # 2) Discover all Canadian teams from /teams index
         soup_t, _ = _fetch_usports_page_rows(ctx, page, teams_index_url, timeout_ms=25000)
         if soup_t:
             for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
@@ -618,6 +622,8 @@ def scrape_usports_canada(browser, league):
                 if bt not in team_urls or (lbl and not team_urls[bt]):
                     team_urls[bt] = lbl
 
+        # 3) Visit each team's roster (?view=roster) & full team stats (?view=lineup)
+        print(f"[DEBUG][USPORTS {season}] Visiting {len(team_urls)} team rosters & stats...")
         for t_url, t_name in list(team_urls.items()):
             soup_r, rows_r = _fetch_usports_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
             if soup_r and not t_name and soup_r.find("h1"):
@@ -625,8 +631,16 @@ def scrape_usports_canada(browser, league):
             for r in rows_r:
                 upsert_player(r, default_team=t_name, is_roster=True)
 
-        records = [
-            build_european_record(
+            _, rows_ts = _fetch_usports_page_rows(ctx, page, f"{t_url}?view=lineup", timeout_ms=20000)
+            for r in rows_ts:
+                upsert_player(r, default_team=t_name, is_roster=False)
+
+        records = []
+        stat_hints = {}
+        for p in merged.values():
+            if p["sp"] == 0 and p["pts"] == 0 and p["k"] == 0:
+                continue
+            rec = build_european_record(
                 league=league, name=p["name"], team=p["team"], pos_raw=p["pos"],
                 class_raw=p["yr"], height_raw=p["ht"], matches=p["gp"], sets=p["sp"],
                 kills=p["k"], atk_err=p["e"], atk_att=p["ta"], aces=p["sa"],
@@ -634,10 +648,10 @@ def scrape_usports_canada(browser, league):
                 profile_url=p["profile_url"], raw_pts=p["pts"], raw_hit_pct=p["pct"],
                 raw_total_blocks=p["btot"],
             )
-            for p in merged.values()
-            if p["sp"] > 0 or p["pts"] > 0 or p["k"] > 0
-        ]
-        records = _enrich_college_records_from_vb(records, max_new=150)
+            stat_hints[rec["player_id"]] = {"assists": p["ast"], "digs": p["dig"]}
+            records.append(rec)
+
+        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=150)
         grad_cnt = sum(1 for r in records if r["grad_2027"])
         print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted, {grad_cnt} graduating Summer 2027).")
         return records
