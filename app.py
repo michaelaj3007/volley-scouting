@@ -20,6 +20,7 @@ st.set_page_config(page_title="MSA Volley Scouting", page_icon="🏐", layout="w
 DATA_PATH = "data/players.csv"
 META_PATH = "data/last_updated.json"
 OVERRIDES_PATH = "data/manual_overrides.csv"
+EMPTY_PIXEL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
 st.session_state.setdefault("lang", "el")
 logo_path, logo_thumb = load_logo_assets()
@@ -173,7 +174,7 @@ def merge_crm(base_df, crm_data, cur_lang):
     df["contact_display"] = df["contact_status"].map(lambda v: label_contact(v, cur_lang))
     df["agent_display"] = df["has_agent"].map(lambda v: label_agent(v, cur_lang))
     df["msa_badge"] = df["is_our_client"].map(
-        lambda x: (logo_thumb if logo_thumb else "⭐") if x else (None if logo_thumb else "")
+        lambda x: (logo_thumb if logo_thumb else "⭐") if x else (EMPTY_PIXEL if logo_thumb else "")
     )
     return df
 
@@ -385,7 +386,7 @@ with tab_leaders:
     else:
         def show_board(title, data, sort_col, stat_cols):
             st.markdown(f"### {title}")
-            cols = ["name"] + stat_cols + ["team", "position", "height_cm", "sets"]
+            cols = ["name"] + stat_cols + ["team", "position", "height_cm", "age", "sets"]
             top_df = data.sort_values(by=sort_col, ascending=False).head(top_n)
             render_styled_table(top_df, cols, COMMON_CFG, rank_index=True)
 
