@@ -1,7 +1,6 @@
 import re
 import time
-import unicodedata
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -104,15 +103,25 @@ def _parse_usports_table(soup, base_url):
     return best_rows
 
 
-def _load_page_rows(page, url, timeout_ms=40000):
+def _load_page_rows(ctx, page, url, timeout_ms=35000):
     soup, rows = None, []
     try:
-        resp = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        resp = ctx.request.get(url, timeout=timeout_ms)
+        if resp.status == 200 and "<table" in resp.text().lower():
+            soup = BeautifulSoup(resp.text(), "lxml")
+            rows = _parse_usports_table(soup, url)
+            if rows:
+                return soup, rows
+    except Exception:
+        pass
+
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if resp and resp.status >= 400:
             print(f"[DEBUG][CANADA] HTTP {resp.status} on {url}")
             return soup, []
-        page.wait_for_selector("table", state="attached", timeout=15000)
-        page.wait_for_timeout(1000)
+        page.wait_for_selector("table", state="attached", timeout=18000)
+        page.wait_for_timeout(1500)
         soup = BeautifulSoup(page.content(), "lxml")
         rows = _parse_usports_table(soup, url)
     except Exception as exc:
@@ -122,13 +131,13 @@ def _load_page_rows(page, url, timeout_ms=40000):
 
 def scrape_canada_usports(browser, league):
     season = league.get("season", "2026-27")
-    candidate_urls = [
+    main_candidates = [
         league.get("url"),
         f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
         f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&pos=all",
         f"https://universitysport.prestosports.com/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
     ]
-    candidate_urls = [u for i, u in enumerate(candidate_urls) if u and u not in candidate_urls[:i]]
+    main_candidates = [u for i, u in enumerate(main_candidates) if u and u not in main_candidates[:i]]
     teams_index_url = f"https://en.usports.ca/sports/mvball/{season}/teams"
 
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
@@ -179,10 +188,10 @@ def scrape_canada_usports(browser, league):
     records = []
     try:
         soup_main = None
-        for m_url in candidate_urls:
+        for m_url in main_candidates:
             print(f"[{league['name']} ({season})] Opening {m_url}")
-            soup_main, rows_main = _load_page_rows(page, m_url, timeout_ms=45000)
-            print(f"[DEBUG][CANADA {season}] {m_url} -> {len(rows_main)} players")
+            soup_main, rows_main = _load_page_rows(ctx, page, m_url, timeout_ms=40000)
+            print(f"[DEBUG][CANADA {season}] {m_url} -> {len(rows_main)} rows")
             if rows_main:
                 for r in rows_main:
                     upsert_player(r)
@@ -196,7 +205,7 @@ def scrape_canada_usports(browser, league):
                 bt = urljoin("https://en.usports.ca/", a["href"]).split("?")[0].rstrip("/")
                 team_urls.setdefault(bt, clean(a.get_text(" ")))
 
-        soup_t, _ = _load_page_rows(page, teams_index_url, timeout_ms=25000)
+        soup_t, _ = _load_page_rows(ctx, page, teams_index_url, timeout_ms=25000)
         if soup_t:
             for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
                 bt = urljoin(teams_index_url, a["href"]).split("?")[0].rstrip("/")
@@ -204,17 +213,17 @@ def scrape_canada_usports(browser, league):
                 if bt not in team_urls or (lbl and not team_urls[bt]):
                     team_urls[bt] = lbl
 
-        print(f"[DEBUG][CANADA {season}] Found {len(team_urls)} teams. Reading rosters & team stats...")
+        print(f"[DEBUG][CANADA {season}] Found {len(team_urls)} teams. Reading rosters & stats...")
         for t_url, t_name in list(team_urls.items()):
-            time.sleep(0.3)
-            soup_r, rows_r = _load_page_rows(page, f"{t_url}?view=roster", timeout_ms=20000)
+            time.sleep(0.2)
+            soup_r, rows_r = _load_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
             if soup_r and not t_name and soup_r.find("h1"):
                 t_name = clean(soup_r.find("h1").get_text(" "))
             for r in rows_r:
                 upsert_player(r, default_team=t_name, is_roster=True)
 
-            time.sleep(0.3)
-            _, rows_ts = _load_page_rows(page, f"{t_url}?view=lineup", timeout_ms=20000)
+            time.sleep(0.2)
+            _, rows_ts = _load_page_rows(ctx, page, f"{t_url}?view=lineup", timeout_ms=20000)
             for r in rows_ts:
                 upsert_player(r, default_team=t_name, is_roster=False)
 
