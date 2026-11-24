@@ -46,6 +46,45 @@ def _name_tokens(name):
     return [t for t in cleaned.split() if len(t) >= 2]
 
 
+def parse_any_height_to_cm(raw_val):
+    s = _clean(raw_val)
+    if not s:
+        return 0
+
+    m_ft = re.search(
+        r"\b([5-7])\s*(?:ft\.?|feet|'|′|-)\s*(\d{1,2})(?:\s*(?:in\.?|inches|\"|″))?\b",
+        s,
+        re.IGNORECASE,
+    )
+    if m_ft:
+        ft = int(m_ft.group(1))
+        inches = int(m_ft.group(2))
+        if 0 <= inches <= 11:
+            cm = int(round((ft * 12 + inches) * 2.54))
+            if 150 <= cm <= 235:
+                return cm
+
+    m_meters = re.search(r"\b([12])[.,](\d{2})\s*m?\b", s, re.IGNORECASE)
+    if m_meters:
+        cm = int(m_meters.group(1)) * 100 + int(m_meters.group(2))
+        if 150 <= cm <= 235:
+            return cm
+
+    m_cm = re.search(r"\b(1[5-9]\d|2[0-3]\d)\b", s)
+    if m_cm:
+        return int(m_cm.group(1))
+
+    return 0
+
+
+def parse_any_birth_year(raw_val):
+    s = _clean(raw_val)
+    if not s:
+        return 0
+    m_y = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", s)
+    return int(m_y.group(1)) if m_y else 0
+
+
 def _load_cache():
     if os.path.exists(CACHE_PATH):
         try:
@@ -85,23 +124,36 @@ def _parse_vb_player_page(html_text):
                     break
 
         elif low in ("height", "heigth") and height_cm == 0 and val:
-            m_h = re.search(r"(1[5-9]\d|2[0-3]\d)", val)
-            if m_h:
-                height_cm = int(m_h.group(1))
+            height_cm = parse_any_height_to_cm(val)
 
-        elif low in ("birthdate", "birth date", "date of birth", "born") and birth_year == 0 and val:
-            m_y = re.search(r"(19\d{2}|20[0-1]\d)", val)
-            if m_y:
-                birth_year = int(m_y.group(1))
+        elif low in ("birthdate", "birth date", "date of birth", "born", "birthday") and birth_year == 0 and val:
+            birth_year = parse_any_birth_year(val)
 
         elif low in ("nationality", "country") and not nationality and val and len(val) <= 30:
             nationality = val
 
     full_txt = " ".join(lines)
     if height_cm == 0:
-        m_h = re.search(r"\b(1[7-9]\d|2[0-2]\d)\s*cm\b", full_txt, re.IGNORECASE)
-        if m_h:
-            height_cm = int(m_h.group(1))
+        m_h_ctx = re.search(
+            r"(?:height|heigth)\s*[:\-]?\s*([5-7]\s*(?:ft|'|′|-)\s*\d{1,2}|[12][.,]\d{2}\s*m?|(?:1[6-9]\d|2[0-3]\d)\s*cm)",
+            full_txt,
+            re.IGNORECASE,
+        )
+        if m_h_ctx:
+            height_cm = parse_any_height_to_cm(m_h_ctx.group(1))
+        else:
+            m_cm = re.search(r"\b(1[7-9]\d|2[0-2]\d)\s*cm\b", full_txt, re.IGNORECASE)
+            if m_cm:
+                height_cm = int(m_cm.group(1))
+
+    if birth_year == 0:
+        m_b_ctx = re.search(
+            r"(?:birth\s*date|birthdate|date\s*of\s*birth|born)\s*[:\-]?\s*([^\n|]{4,25})",
+            full_txt,
+            re.IGNORECASE,
+        )
+        if m_b_ctx:
+            birth_year = parse_any_birth_year(m_b_ctx.group(1))
 
     if not pos:
         for k, mapped in VB_ROLE_MAP.items():
@@ -181,7 +233,9 @@ def enrich_missing_bios_from_volleybox(df, max_new_lookups=450):
     cache = _load_cache()
     to_lookup = {}
 
-    for _, row in df.iterrows():
+    ordered_df = df.sort_values(by=["points", "sets"], ascending=[False, False])
+
+    for _, row in ordered_df.iterrows():
         need_pos = str(row.get("position", "")).strip() in ("", "Unknown")
         need_h = int(row.get("height_cm", 0) or 0) == 0
         need_b = int(row.get("birth_year", 0) or 0) == 0
@@ -248,5 +302,7 @@ def enrich_missing_bios_from_volleybox(df, max_new_lookups=450):
         if changed:
             updated_rows += 1
 
-    print(f"[Volleybox] Checked {len(to_lookup)} new players, enriched {updated_rows} profiles across all leagues (cache: {len(cache)}).")
+    print(
+        f"[Volleybox] Checked {len(to_lookup)} new players, enriched {updated_rows} profiles across all leagues (cache: {len(cache)})."
+    )
     return df
