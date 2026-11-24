@@ -79,5 +79,41 @@
     "type": "cvf_cz",
     "competition_id": "ex-m",
     "url": "https://dv.cvf.cz/statistika/zebricky/2026-27/ex-m/"
+  },
+  {
+    "name": "USA - NCAA Division I/II",
+    "country": "USA",
+    "gender": "M",
+    "type": "ncaa_us",
+    "season": "2025-26",
+    "competition_id": "ncaa-nc",
+    "url": "https://www.ncaa.com/stats/volleyball-men/nc"
+  },
+  {
+    "name": "USA - NCAA Division I/II",
+    "country": "USA",
+    "gender": "M",
+    "type": "ncaa_us",
+    "season": "2026-27",
+    "competition_id": "ncaa-nc",
+    "url": "https://www.ncaa.com/stats/volleyball-men/nc"
+  },
+  {
+    "name": "Canada - U SPORTS",
+    "country": "Canada",
+    "gender": "M",
+    "type": "usports_ca",
+    "season": "2025-26",
+    "competition_id": "usports-m",
+    "url": "https://en.usports.ca/sports/mvball/2025-26/players?sort=pts&view=lineup&pos=all"
+  },
+  {
+    "name": "Canada - U SPORTS",
+    "country": "Canada",
+    "gender": "M",
+    "type": "usports_ca",
+    "season": "2026-27",
+    "competition_id": "usports-m",
+    "url": "https://en.usports.ca/sports/mvball/2026-27/players?sort=pts&view=lineup&pos=all"
   }
 ]
