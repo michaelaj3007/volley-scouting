@@ -1,9 +1,13 @@
 import json
 import os
 import re
+import time
 import unicodedata
-from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from urllib.parse import quote_plus, urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 
 HEADERS = {
@@ -13,9 +17,10 @@ HEADERS = {
 
 ROLE_MAP = {
     "setter": "Setter", "s": "Setter",
-    "opposite": "Opposite", "right side": "Opposite", "rs": "Opposite", "opp": "Opposite",
-    "outside": "Outside Hitter", "oh": "Outside Hitter", "left side": "Outside Hitter", "ls": "Outside Hitter",
-    "middle": "Middle Blocker", "mb": "Middle Blocker", "mh": "Middle Blocker",
+    "opposite": "Opposite", "right side": "Opposite", "rs": "Opposite", "opp": "Opposite", "universal": "Opposite",
+    "outside": "Outside Hitter", "outside hitter": "Outside Hitter", "wing spiker": "Outside Hitter",
+    "oh": "Outside Hitter", "left side": "Outside Hitter", "ls": "Outside Hitter",
+    "middle": "Middle Blocker", "middle blocker": "Middle Blocker", "mb": "Middle Blocker", "mh": "Middle Blocker",
     "libero": "Libero", "l": "Libero", "ds": "Libero", "l/ds": "Libero",
 }
 
@@ -30,6 +35,7 @@ NCAA_FALLBACK_CATEGORIES = [
 ]
 
 NCAA_25_26_CACHE = "data/ncaa_2025_26_cache.json"
+VB_CACHE_PATH = "data/volleybox_cache.json"
 
 
 def clean(text):
@@ -40,6 +46,13 @@ def slugify(text):
     norm = unicodedata.normalize("NFKD", str(text or ""))
     ascii_txt = "".join(ch for ch in norm if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]+", "_", ascii_txt.lower()).strip("_") or "unknown"
+
+
+def _name_tokens(name):
+    norm = unicodedata.normalize("NFKD", str(name or ""))
+    ascii_txt = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", ascii_txt.lower())
+    return [t for t in cleaned.split() if len(t) >= 2]
 
 
 def to_float(val):
@@ -152,6 +165,206 @@ def _find_col_idx(headers, candidates):
     return None
 
 
+def _infer_position_from_stats(sets, kills, atk_att, blocks, assists, digs):
+    if sets <= 0:
+        return "Unknown"
+    ast_ps = assists / sets
+    blk_ps = blocks / sets
+    att_ps = atk_att / sets
+    k_ps = kills / sets
+
+    if ast_ps >= 3.5:
+        return "Setter"
+    if digs > 0 and kills == 0 and blocks == 0 and atk_att <= 2:
+        return "Libero"
+    if blk_ps >= 0.68 and att_ps < 5.2:
+        return "Middle Blocker"
+    if k_ps >= 1.0 or att_ps >= 2.5:
+        return "Outside Hitter"
+    return "Unknown"
+
+
+def _parse_vb_page(html_text):
+    soup = BeautifulSoup(html_text, "lxml")
+    pos, height_cm, birth_year, nationality = "", 0, 0, ""
+
+    # Check structured <dt>/<dd> and <tr>/<td> pairs first
+    for dt in soup.find_all(["dt", "th", "td"]):
+        lbl = clean(dt.get_text(" ")).rstrip(":").lower()
+        sib = dt.find_next_sibling(["dd", "td"])
+        if not sib:
+            continue
+        val = clean(sib.get_text(" "))
+        if not val:
+            continue
+        if lbl in ("position", "positions", "role") and not pos:
+            mapped = norm_pos(val)
+            if mapped != "Unknown":
+                pos = mapped
+        elif lbl in ("height", "heigth") and height_cm == 0:
+            height_cm = parse_height_to_cm(val)
+        elif lbl in ("birthdate", "birth date", "date of birth", "born", "birthday") and birth_year == 0:
+            ym = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", val)
+            if ym:
+                birth_year = int(ym.group(1))
+        elif lbl in ("nationality", "country") and not nationality and len(val) <= 30:
+            nationality = val
+
+    lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
+    for i, line in enumerate(lines):
+        low = line.rstrip(":").lower()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        same = line.split(":", 1)[1].strip() if ":" in line else ""
+        val = same or nxt
+        if not val:
+            continue
+        if low in ("position", "positions", "role") and not pos:
+            mapped = norm_pos(val)
+            if mapped != "Unknown":
+                pos = mapped
+        elif low in ("height", "heigth") and height_cm == 0:
+            height_cm = parse_height_to_cm(val)
+        elif low in ("birthdate", "birth date", "date of birth", "born", "birthday") and birth_year == 0:
+            ym = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", val)
+            if ym:
+                birth_year = int(ym.group(1))
+        elif low in ("nationality", "country") and not nationality and len(val) <= 30:
+            nationality = val
+
+    if not pos:
+        full_txt = " ".join(lines)
+        for k, mapped in (
+            ("outside hitter", "Outside Hitter"),
+            ("middle blocker", "Middle Blocker"),
+            ("opposite", "Opposite"),
+            ("setter", "Setter"),
+            ("libero", "Libero"),
+        ):
+            if re.search(rf"\b{k}\b", full_txt, re.IGNORECASE):
+                pos = mapped
+                break
+
+    return {"position": pos, "height_cm": height_cm, "birth_year": birth_year, "nationality": nationality}
+
+
+def _lookup_vb_single(name):
+    tokens = _name_tokens(name)
+    if len(tokens) < 2:
+        return {"not_found": True}
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    q = quote_plus(" ".join(tokens))
+
+    candidate_urls = []
+    for s_url in (f"https://volleybox.net/players?q={q}", f"https://volleybox.net/search?q={q}"):
+        try:
+            resp = session.get(s_url, timeout=15)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = urljoin("https://volleybox.net/", a["href"])
+                m = re.search(r"https?://(?:www\.)?volleybox\.net/(?:[a-z]{2}/)?([a-z0-9\-]+-p\d+)", href, re.IGNORECASE)
+                if not m:
+                    continue
+                slug = m.group(1).lower()
+                if all(tok in slug for tok in tokens):
+                    cu = f"https://volleybox.net/{slug}"
+                    if cu not in candidate_urls:
+                        candidate_urls.append(cu)
+            if candidate_urls:
+                break
+        except Exception:
+            continue
+
+    for p_url in candidate_urls[:3]:
+        try:
+            time.sleep(0.2)
+            resp = session.get(p_url, timeout=15)
+            if resp.status_code != 200:
+                continue
+            info = _parse_vb_page(resp.text)
+            if info["position"] or info["height_cm"] > 0 or info["birth_year"] > 0 or info["nationality"]:
+                return info
+        except Exception:
+            continue
+
+    return {"not_found": True}
+
+
+def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
+    if not records:
+        return records
+
+    cache = {}
+    if os.path.exists(VB_CACHE_PATH):
+        try:
+            with open(VB_CACHE_PATH, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    to_lookup = {}
+    for r in records:
+        if r["position"] != "Unknown" and r["height_cm"] > 0 and r["birth_year"] > 0 and r["nationality"]:
+            continue
+        toks = _name_tokens(r["name"])
+        if len(toks) < 2:
+            continue
+        ck = f"{'_'.join(toks)}_0"
+        if ck not in cache and ck not in to_lookup and len(to_lookup) < max_new:
+            to_lookup[ck] = r["name"]
+
+    if to_lookup:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {ex.submit(_lookup_vb_single, nm): ck for ck, nm in to_lookup.items()}
+            for fut in as_completed(futs):
+                ck = futs[fut]
+                try:
+                    cache[ck] = fut.result()
+                except Exception:
+                    cache[ck] = {"not_found": True}
+        os.makedirs(os.path.dirname(VB_CACHE_PATH), exist_ok=True)
+        with open(VB_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+    vb_hits = 0
+    for r in records:
+        toks = _name_tokens(r["name"])
+        ck = f"{'_'.join(toks)}_0" if len(toks) >= 2 else ""
+        info = cache.get(ck) if ck else None
+        if info and not info.get("not_found"):
+            if r["position"] == "Unknown" and info.get("position"):
+                r["position"] = info["position"]
+                vb_hits += 1
+            if r["height_cm"] == 0 and int(info.get("height_cm", 0)) > 0:
+                r["height_cm"] = int(info["height_cm"])
+            if r["birth_year"] == 0 and int(info.get("birth_year", 0)) > 0:
+                by = int(info["birth_year"])
+                r["birth_year"] = by
+                r["age"] = datetime.now().year - by
+            if not r["nationality"] and info.get("nationality"):
+                r["nationality"] = info["nationality"]
+
+        # Fallback: infer role from NCAA stat profile if still Unknown
+        if r["position"] == "Unknown" and stat_hints:
+            h = stat_hints.get(r["player_id"], {})
+            inferred = _infer_position_from_stats(
+                sets=r["sets"],
+                kills=r["attack_points"],
+                atk_att=r["attack_total"],
+                blocks=r["blocks"],
+                assists=h.get("assists", 0),
+                digs=h.get("digs", 0),
+            )
+            if inferred != "Unknown":
+                r["position"] = inferred
+
+    print(f"[College Volleybox] Checked {len(to_lookup)} new players, filled {vb_hits} positions from Volleybox.")
+    return records
+
+
 def build_european_record(
     league, name, team, pos_raw, class_raw, height_raw,
     matches, sets, kills, atk_err, atk_att, aces, serve_err,
@@ -161,7 +374,6 @@ def build_european_record(
     season = league.get("season", "2026-27")
     is_can = league["country"] == "Canada"
 
-    # European-equivalent blocks: Solo (1.0) + half of shared Block Assists (0.5 each)
     if bs > 0 or ba > 0:
         eu_blocks = int(round(bs + 0.5 * ba))
     elif raw_total_blocks > 0:
@@ -313,9 +525,7 @@ def _parse_usports_table(soup, base_url):
 
 
 def _fetch_usports_page_rows(ctx, page, url, timeout_ms=30000):
-    # First try lightweight fetch; fall back to full browser render if JS populates the table
-    soup = None
-    rows = []
+    soup, rows = None, []
     try:
         resp = ctx.request.get(url, timeout=timeout_ms)
         if resp.status == 200:
@@ -340,7 +550,6 @@ def _fetch_usports_page_rows(ctx, page, url, timeout_ms=30000):
 
 def scrape_usports_canada(browser, league):
     season = league.get("season", "2026-27")
-    # U SPORTS splits stats across 3 PrestoSports views: Offense (of), Defense/Blocks (df), Serve/Receive (sr)
     stat_urls = [
         ("offense", f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&pos=of&r=0"),
         ("offense_q", f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=of"),
@@ -351,23 +560,14 @@ def scrape_usports_canada(browser, league):
 
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
     page = ctx.new_page()
-    merged = {}
-    alias_to_key = {}
-    team_urls = {}
+    merged, alias_to_key, team_urls = {}, {}, {}
 
     def upsert_player(row, default_team="", is_roster=False):
         team_name = row["team"] or default_team
         slug = row["slug"]
         isk = _initial_surname_key(row["name"], team_name)
 
-        key = None
-        if slug and slug in merged:
-            key = slug
-        elif isk and isk in alias_to_key:
-            key = alias_to_key[isk]
-        else:
-            key = slug or f"{slugify(row['name'])}_{slugify(team_name)}"
-
+        key = slug if (slug and slug in merged) else (alias_to_key[isk] if (isk and isk in alias_to_key) else (slug or f"{slugify(row['name'])}_{slugify(team_name)}"))
         if key not in merged:
             merged[key] = {
                 "name": row["name"], "team": team_name, "pos": "", "yr": "", "ht": "",
@@ -379,7 +579,6 @@ def scrape_usports_canada(browser, league):
             alias_to_key.setdefault(isk, key)
 
         cur = merged[key]
-        # Prefer full name ("Kaden Schmidt") over abbreviated ("K Schmidt")
         is_abbrev = bool(re.match(r"^[A-Z]\.?\s+", row["name"]))
         cur_abbrev = bool(re.match(r"^[A-Z]\.?\s+", cur["name"]))
         if (is_roster and not is_abbrev) or (cur_abbrev and not is_abbrev):
@@ -398,7 +597,6 @@ def scrape_usports_canada(browser, league):
             cur["pct"] = row["pct"]
 
     try:
-        # 1) Pull all 3 league-wide stats tabs (Offense, Defense/Blocks, Serve/Receive)
         for label, s_url in stat_urls:
             soup_s, rows_s = _fetch_usports_page_rows(ctx, page, s_url, timeout_ms=35000)
             print(f"[DEBUG][USPORTS {season}] {label}: {len(rows_s)} rows")
@@ -412,7 +610,6 @@ def scrape_usports_canada(browser, league):
                     bt = urljoin(s_url, a["href"]).split("?")[0].rstrip("/")
                     team_urls.setdefault(bt, clean(a.get_text(" ")))
 
-        # 2) Discover any remaining schools from the teams index
         soup_t, _ = _fetch_usports_page_rows(ctx, page, teams_index_url, timeout_ms=25000)
         if soup_t:
             for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
@@ -421,17 +618,12 @@ def scrape_usports_canada(browser, league):
                 if bt not in team_urls or (lbl and not team_urls[bt]):
                     team_urls[bt] = lbl
 
-        # 3) Pull each team's roster (?view=roster) for Full Name, Position, Year (Yr -> Grad 2027), Height
-        print(f"[DEBUG][USPORTS {season}] Enriching bios from {len(team_urls)} team rosters...")
-        roster_hits = 0
         for t_url, t_name in list(team_urls.items()):
             soup_r, rows_r = _fetch_usports_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
             if soup_r and not t_name and soup_r.find("h1"):
                 t_name = clean(soup_r.find("h1").get_text(" "))
             for r in rows_r:
                 upsert_player(r, default_team=t_name, is_roster=True)
-                roster_hits += 1
-        print(f"[DEBUG][USPORTS {season}] Matched {roster_hits} roster entries.")
 
         records = [
             build_european_record(
@@ -445,6 +637,7 @@ def scrape_usports_canada(browser, league):
             for p in merged.values()
             if p["sp"] > 0 or p["pts"] > 0 or p["k"] > 0
         ]
+        records = _enrich_college_records_from_vb(records, max_new=150)
         grad_cnt = sum(1 for r in records if r["grad_2027"])
         print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted, {grad_cnt} graduating Summer 2027).")
         return records
@@ -536,6 +729,8 @@ def scrape_ncaa_mens(browser, league):
                 i_ba = _find_col_idx(headers, ["block assists", "ba"])
                 i_btot = _find_col_idx(headers, ["total blocks", "tot", "blk"])
                 i_pts = _find_col_idx(headers, ["points", "pts"])
+                i_ast = _find_col_idx(headers, ["assists", "ast"])
+                i_dig = _find_col_idx(headers, ["digs", "dig"])
 
                 rows_added = 0
                 for tr in tbl.find_all("tr"):
@@ -556,13 +751,14 @@ def scrape_ncaa_mens(browser, league):
                     entry = merged.setdefault(key, {
                         "name": name, "team": team, "pos": "", "cl": "", "ht": "",
                         "sets": 0, "kills": 0, "err": 0, "att": 0, "hit_pct": 0.0,
-                        "aces": 0, "bs": 0, "ba": 0, "btot": 0.0, "raw_pts": 0.0, "url": p_url,
+                        "aces": 0, "bs": 0, "ba": 0, "btot": 0.0, "raw_pts": 0.0,
+                        "assists": 0, "digs": 0, "url": p_url,
                     })
                     for fld, idx in (("pos", i_pos), ("cl", i_cl), ("ht", i_ht)):
                         if idx is not None and idx < len(cells) and cells[idx] not in ("", "-"):
                             entry[fld] = cells[idx]
                     entry["sets"] = max(entry["sets"], gi(i_s))
-                    for fld, idx in (("kills", i_k), ("err", i_e), ("att", i_ta), ("aces", i_sa), ("bs", i_bs), ("ba", i_ba)):
+                    for fld, idx in (("kills", i_k), ("err", i_e), ("att", i_ta), ("aces", i_sa), ("bs", i_bs), ("ba", i_ba), ("assists", i_ast), ("digs", i_dig)):
                         if idx is not None:
                             entry[fld] = max(entry[fld], gi(idx))
                     if i_pct is not None and gf(i_pct) != 0.0:
@@ -576,8 +772,10 @@ def scrape_ncaa_mens(browser, league):
                     break
             print(f"[DEBUG][NCAA {season}] {cat}: {len(merged)} unique players so far")
 
-        records = [
-            build_european_record(
+        records = []
+        stat_hints = {}
+        for e in merged.values():
+            rec = build_european_record(
                 league=league, name=e["name"], team=e["team"], pos_raw=e["pos"],
                 class_raw=e["cl"], height_raw=e["ht"], matches=0, sets=e["sets"],
                 kills=e["kills"], atk_err=e["err"], atk_att=e["att"], aces=e["aces"],
@@ -585,8 +783,11 @@ def scrape_ncaa_mens(browser, league):
                 profile_url=e["url"], raw_pts=e["raw_pts"], raw_hit_pct=e["hit_pct"],
                 raw_total_blocks=e["btot"],
             )
-            for e in merged.values()
-        ]
+            stat_hints[rec["player_id"]] = {"assists": e["assists"], "digs": e["digs"]}
+            records.append(rec)
+
+        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=350)
+
         if season == "2025-26" and records:
             os.makedirs("data", exist_ok=True)
             with open(NCAA_25_26_CACHE, "w", encoding="utf-8") as f:
