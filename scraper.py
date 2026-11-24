@@ -2,6 +2,7 @@ import html
 import json
 import os
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -12,6 +13,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from czech_scraper import scrape_cvf_cz_league
+from volleybox_enricher import enrich_missing_bios_from_volleybox
 
 HEADERS = {
     "User-Agent": (
@@ -22,7 +24,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Specific/compound roles MUST appear before shorter substrings (e.g. feladóátló before feladó, högerspiker before spiker)
 ROLE_MAP = {
     "feladóátló": "Opposite",
     "feladoatlo": "Opposite",
@@ -126,6 +127,11 @@ def clean_text(text):
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
+def strip_accents(text):
+    norm = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in norm if not unicodedata.combining(ch))
+
+
 def to_float(val):
     if val is None:
         return 0.0
@@ -165,7 +171,8 @@ def extract_query_param(url, param_name):
 
 
 def normalize_header(h):
-    return re.sub(r"\s+", " ", clean_text(h).lower())
+    s = strip_accents(clean_text(h)).lower().replace(".", " ")
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def find_col(headers, exact_candidates, start_idx=0, end_idx=None):
@@ -217,7 +224,8 @@ def parse_radgrid_page(soup, league):
     for table in soup.find_all("table"):
         for tr in table.find_all("tr")[:5]:
             h_cells = [normalize_header(c.get_text()) for c in tr.find_all(["th", "td"])]
-            if "playerid" in h_cells or ("player" in h_cells and "points" in h_cells):
+            h_ns = [c.replace(" ", "") for c in h_cells]
+            if "playerid" in h_ns or sum(1 for c in h_ns if c.endswith("#")) >= 3:
                 headers = h_cells
                 break
         if headers:
@@ -226,53 +234,95 @@ def parse_radgrid_page(soup, league):
     if not headers:
         return {}
 
+    h_ns = [c.replace(" ", "") for c in headers]
+
     i_pid = find_col(headers, ["playerid", "player id", "id"])
-    i_player = find_col(headers, ["player", "jucător", "jucator", "igrac", "igrač", "hráč", "играч", "παίκτης", "spelare", "játékos", "pelaaja"])
+    i_player = find_col(headers, ["player", "jucator", "igrac", "hrac", "играч", "παικτης", "spelare", "jatekos", "pelaaja"])
     i_surname = find_col(headers, ["surname", "last name"])
     i_name = find_col(headers, ["name", "first name"])
-    i_team = find_col(headers, ["team", "echipa", "club", "klub", "družstvo", "tým", "отбор", "ομάδα", "lag", "csapat", "joukkue"])
-    i_country = find_col(headers, ["country", "nation", "nat"])
-    i_matches = find_col(headers, ["matches", "meciuri", "played", "m", "z"])
-    i_sets = find_col(headers, ["sets", "seturi", "s"])
-    i_points = find_col(headers, ["points", "puncte", "pts", "tot", "b"])
-    i_bp = find_col(headers, ["bp", "break points"])
-    i_wl = find_col(headers, ["w-p", "w-l", "wl"])
+    i_team = find_col(headers, ["team", "echipa", "club", "klub", "klubb", "forening", "druzstvo", "tym", "lag", "csapat", "egyesulet", "joukkue", "seura", "ekipa", "tim", "отбор", "ομαδα"])
+    i_country = find_col(headers, ["country", "nation", "nat", "land", "orszag", "krajina", "maa", "drzava"])
 
-    i_s_err = find_col(headers, ["s =", "s="])
-    i_s_ok = find_col(headers, ["s !", "s!"])
-    i_s_slash = find_col(headers, ["s /", "s/"])
-    i_s_neg = find_col(headers, ["s -", "s-"])
-    i_s_pos = find_col(headers, ["s +", "s+"])
-    i_s_ace = find_col(headers, ["s #", "s#", "s pts", "aces", "ace"])
+    eq_cols = [i for i, c in enumerate(h_ns) if c.endswith("=")]
+    hash_cols = [i for i, c in enumerate(h_ns) if c.endswith("#") or c in ("aces", "ace", "blk", "blocks", "block")]
 
-    i_r_err = find_col(headers, ["r =", "r="])
-    i_r_ok = find_col(headers, ["r !", "r!"])
-    i_r_slash = find_col(headers, ["r /", "r/"])
-    i_r_neg = find_col(headers, ["r -", "r-"])
-    i_r_pos = find_col(headers, ["r +", "r+"])
-    i_r_perf = find_col(headers, ["r #", "r#"])
+    i_s_err = eq_cols[0] if len(eq_cols) >= 1 else None
+    i_r_err = eq_cols[1] if len(eq_cols) >= 2 else None
+    i_a_err = eq_cols[2] if len(eq_cols) >= 3 else None
+    i_b_err = eq_cols[3] if len(eq_cols) >= 4 else None
 
-    i_a_err = find_col(headers, ["a =", "a="])
-    i_a_ok = find_col(headers, ["a !", "a!"])
-    i_a_blk = find_col(headers, ["a /", "a/"])
-    i_a_neg = find_col(headers, ["a -", "a-"])
-    i_a_pos = find_col(headers, ["a +", "a+"])
-    i_a_pts = find_col(headers, ["a #", "a#", "a pts", "atk pts"])
+    i_s_ace = hash_cols[0] if len(hash_cols) >= 1 else None
+    i_r_perf = hash_cols[1] if len(hash_cols) >= 2 else None
+    i_a_pts = hash_cols[2] if len(hash_cols) >= 3 else None
+    i_b_pts = hash_cols[3] if len(hash_cols) >= 4 else None
 
-    i_b_err = find_col(headers, ["b =", "b="])
-    i_b_pts = find_col(headers, ["b #", "b#", "b pts", "blk", "blocks", "block"])
+    def find_symbol(sym, start_i, end_i):
+        if start_i is None or end_i is None:
+            return None
+        for idx in range(start_i + 1, end_i):
+            if h_ns[idx].endswith(sym):
+                return idx
+        return None
+
+    i_s_ok = find_symbol("!", i_s_err, i_s_ace)
+    i_s_slash = find_symbol("/", i_s_err, i_s_ace)
+    i_s_neg = find_symbol("-", i_s_err, i_s_ace)
+    i_s_pos = find_symbol("+", i_s_err, i_s_ace)
+
+    i_r_ok = find_symbol("!", i_r_err, i_r_perf)
+    i_r_slash = find_symbol("/", i_r_err, i_r_perf)
+    i_r_neg = find_symbol("-", i_r_err, i_r_perf)
+    i_r_pos = find_symbol("+", i_r_err, i_r_perf)
+
+    i_a_ok = find_symbol("!", i_a_err, i_a_pts)
+    i_a_blk = find_symbol("/", i_a_err, i_a_pts)
+    i_a_neg = find_symbol("-", i_a_err, i_a_pts)
+    i_a_pos = find_symbol("+", i_a_err, i_a_pts)
 
     r_start = i_r_perf if i_r_perf is not None else 0
     r_end = i_a_err if i_a_err is not None else len(headers)
     i_r_pos_pct = find_col(headers, ["pos%", "r pos%"], r_start, r_end)
-    i_r_perf_pct = find_col(headers, ["exc.%", "exc%", "perf%"], r_start, r_end)
+    i_r_perf_pct = find_col(headers, ["exc %", "exc%", "perf%"], r_start, r_end)
 
     a_start = i_a_pts if i_a_pts is not None else 0
     a_end = i_b_err if i_b_err is not None else len(headers)
-    i_a_pct = find_col(headers, ["exc. %", "exc.%", "exc%", "a %", "atk %"], a_start, a_end)
+    i_a_pct = find_col(headers, ["exc %", "exc%", "a %", "atk %"], a_start, a_end)
+
+    meta_start = max([idx for idx in [i_pid, i_player, i_surname, i_name, i_team, i_country] if idx is not None] or [1]) + 1
+    meta_end = i_s_err if i_s_err is not None else len(headers)
+
+    i_matches = find_col(headers, ["matches", "match", "matcher", "meciuri", "played", "merkozes", "merkozesek", "merk", "meccs", "meccsek", "zapasy", "zapas", "zap", "ottelut", "ottelu", "ott", "utakmice", "ut", "мачове", "мач", "αγωνες", "m", "z", "o", "u"], meta_start, meta_end)
+    i_sets = find_col(headers, ["sets", "set", "seturi", "sety", "setovi", "szett", "szettek", "jatszma", "jatszmak", "erat", "era", "геймове", "гейм", "σετ", "s", "j", "e"], meta_start, meta_end)
+    i_points = find_col(headers, ["points", "point", "pts", "poang", "pont", "pontok", "body", "bod", "pisteet", "piste", "pist", "puncte", "poeni", "bodovi", "точки", "ποντοι", "tot", "total", "ossz", "b", "p"], meta_start, meta_end)
+    i_bp = find_col(headers, ["bp", "break points"], meta_start, meta_end)
+    i_wl = find_col(headers, ["w-p", "w-l", "wl", "v-p", "+/-"], meta_start, meta_end)
+
+    data_rows = soup.select("tr.rgRow, tr.rgAltRow")
+
+    if i_s_err is not None and data_rows:
+        if i_points is None:
+            best_col, best_hits = None, 0
+            for c in range(meta_start, meta_end):
+                hits = 0
+                for tr in data_rows[:12]:
+                    cs = [clean_text(x.get_text()) for x in tr.find_all(["td", "th"])]
+                    calc = to_int(cell_val(cs, i_a_pts)) + to_int(cell_val(cs, i_s_ace)) + to_int(cell_val(cs, i_b_pts))
+                    if calc > 0 and to_int(cell_val(cs, c)) == calc:
+                        hits += 1
+                if hits > best_hits:
+                    best_hits, best_col = hits, c
+            if best_col is not None and best_hits >= 2:
+                i_points = best_col
+            elif i_s_err - 1 >= meta_start:
+                i_points = i_s_err - 1
+
+        if i_sets is None and i_points is not None and i_points - 1 >= meta_start:
+            i_sets = i_points - 1
+        if i_matches is None and i_sets is not None and i_sets - 1 >= meta_start:
+            i_matches = i_sets - 1
 
     page_players = {}
-    for tr in soup.select("tr.rgRow, tr.rgAltRow"):
+    for tr in data_rows:
         cells = [clean_text(c.get_text()) for c in tr.find_all(["td", "th"])]
         if len(cells) < 10:
             continue
@@ -317,6 +367,11 @@ def parse_radgrid_page(soup, league):
         atk_pct = to_float(cell_val(cells, i_a_pct)) or (round(100.0 * a_pts / a_tot, 1) if a_tot > 0 else 0.0)
         atk_eff_pct = round(100.0 * (a_pts - a_err - a_blk) / a_tot, 1) if a_tot > 0 else 0.0
 
+        blocks = to_int(cell_val(cells, i_b_pts))
+        calc_pts = a_pts + aces + blocks
+        raw_pts = to_int(cell_val(cells, i_points))
+        points = raw_pts if raw_pts >= calc_pts else calc_pts
+
         page_players[pl_id] = {
             "pl_id": pl_id,
             "url": f"{base}/PlayerDetails.aspx?ID={cid}&PlayerID={pl_id}",
@@ -325,7 +380,7 @@ def parse_radgrid_page(soup, league):
             "country": cell_val(cells, i_country),
             "matches": to_int(cell_val(cells, i_matches)),
             "sets": to_int(cell_val(cells, i_sets)),
-            "points": to_int(cell_val(cells, i_points)),
+            "points": points,
             "break_points": to_int(cell_val(cells, i_bp)),
             "won_lost": to_int(cell_val(cells, i_wl)),
             "serve_total": s_tot,
@@ -340,7 +395,7 @@ def parse_radgrid_page(soup, league):
             "attack_blocked": a_blk,
             "attack_pct": atk_pct,
             "attack_eff_pct": atk_eff_pct,
-            "blocks": to_int(cell_val(cells, i_b_pts)),
+            "blocks": blocks,
         }
 
     return page_players
@@ -622,8 +677,9 @@ def main():
     df = pd.DataFrame(all_records)
     if not df.empty:
         df = df.drop_duplicates(subset=["player_id"], keep="first")
-        df = apply_manual_overrides(df)
         df = df.sort_values(by=["points", "name"], ascending=[False, True])
+        df = enrich_missing_bios_from_volleybox(df, max_new_lookups=450)
+        df = apply_manual_overrides(df)
 
     df.to_csv("data/players.csv", index=False, encoding="utf-8-sig")
 
