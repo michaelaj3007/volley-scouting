@@ -30,6 +30,16 @@ ROLE_MAP = {
     "ds": "Libero",
 }
 
+NCAA_COM_CATEGORIES = [
+    ("points", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/755"),
+    ("kills", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/513"),
+    ("blocks", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/516"),
+    ("aces", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/515"),
+    ("hitting", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/512"),
+    ("assists", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/514"),
+    ("digs", "https://www.ncaa.com/stats/volleyball-men/d1/current/individual/517"),
+]
+
 
 def clean(text):
     return re.sub(r"\s+", " ", str(text or "")).strip()
@@ -110,10 +120,15 @@ def parse_height_to_cm(raw_h):
     s = clean(raw_h)
     if not s:
         return 0
-    m_ft = re.search(r"(\d)\s*[-'′]\s*(\d{1,2})", s)
+    m_ft = re.search(r"([5-7])\s*(?:ft\.?|feet|'|′|-)\s*(\d{1,2})", s, re.IGNORECASE)
     if m_ft:
         ft, inch = int(m_ft.group(1)), int(m_ft.group(2))
-        cm = int(round((ft * 12 + inch) * 2.54))
+        if 0 <= inch <= 11:
+            cm = int(round((ft * 12 + inch) * 2.54))
+            return cm if 150 <= cm <= 235 else 0
+    m_meters = re.search(r"\b([12])[.,](\d{2})\s*m?\b", s, re.IGNORECASE)
+    if m_meters:
+        cm = int(m_meters.group(1)) * 100 + int(m_meters.group(2))
         return cm if 150 <= cm <= 235 else 0
     cm = to_int(s)
     return cm if 150 <= cm <= 235 else 0
@@ -122,7 +137,7 @@ def parse_height_to_cm(raw_h):
 def build_european_record(
     league, name, team, pos_raw, class_raw, height_raw,
     matches, sets, kills, atk_err, atk_att, aces, serve_err,
-    bs, ba, rec_tot, rec_err, profile_url, nationality
+    bs, ba, rec_tot, rec_err, profile_url
 ):
     season = league.get("season", "2026-27")
     is_can = league["country"] == "Canada"
@@ -154,7 +169,8 @@ def build_european_record(
         "height_cm": parse_height_to_cm(height_raw),
         "birth_year": 0,
         "age": 0,
-        "nationality": nationality,
+        # Leave empty so volleybox_enricher fills real passport nationality (EU vs Non-EU)
+        "nationality": "",
         "matches": int(matches),
         "sets": int(sets),
         "points": eu_points,
@@ -191,71 +207,93 @@ def _find_col_idx(headers, candidates):
 
 def scrape_usports_canada(browser, league):
     season = league.get("season", "2026-27")
-    url = league.get("url") or f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all"
+    candidate_urls = [
+        league.get("url"),
+        f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
+        f"https://en.usports.ca/sports/mvball/{season}/players?view=lineup",
+        f"https://universitysport.prestosports.com/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all",
+    ]
+    candidate_urls = [u for i, u in enumerate(candidate_urls) if u and u not in candidate_urls[:i]]
+
     records = []
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
     page = ctx.new_page()
     try:
-        print(f"[{league['name']} ({season})] Opening {url}")
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        page.wait_for_selector("table", timeout=15000)
-        soup = BeautifulSoup(page.content(), "lxml")
+        for url in candidate_urls:
+            print(f"[{league['name']} ({season})] Opening {url}")
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                if resp and resp.status >= 400:
+                    continue
+                page.wait_for_selector("table", state="attached", timeout=15000)
+                page.wait_for_timeout(1500)
+            except Exception as exc:
+                print(f"[DEBUG][USPORTS] Load note on {url}: {exc}")
+                continue
 
-        target_table = None
-        headers = []
-        for tbl in soup.find_all("table"):
-            ths = [clean(th.get_text(" ")).lower() for th in tbl.find_all("th")]
-            if any("name" in h or "player" in h for h in ths) and any(h in ("k", "kills", "sp", "s") for h in ths):
-                target_table = tbl
-                headers = ths
+            soup = BeautifulSoup(page.content(), "lxml")
+            target_table = None
+            headers = []
+            for tbl in soup.find_all("table"):
+                for r in tbl.find_all("tr")[:3]:
+                    ths = [clean(c.get_text(" ")).lower() for c in r.find_all(["th", "td"])]
+                    if any("name" in h or "player" in h for h in ths) and any(
+                        h in ("k", "kills", "sp", "s", "pts", "gp") for h in ths
+                    ):
+                        target_table = tbl
+                        headers = ths
+                        break
+                if target_table:
+                    break
+
+            if not target_table:
+                continue
+
+            i_name = _find_col_idx(headers, ["name", "player"])
+            i_team = _find_col_idx(headers, ["team", "school"])
+            i_pos = _find_col_idx(headers, ["pos"])
+            i_yr = _find_col_idx(headers, ["yr", "cl", "year", "class"])
+            i_ht = _find_col_idx(headers, ["ht", "height"])
+            i_mp = _find_col_idx(headers, ["gp", "mp", "m"])
+            i_sp = _find_col_idx(headers, ["sp", "s", "sets"])
+            i_k = _find_col_idx(headers, ["k", "kills"])
+            i_e = _find_col_idx(headers, ["e", "err"])
+            i_ta = _find_col_idx(headers, ["ta", "att"])
+            i_sa = _find_col_idx(headers, ["sa", "ace"])
+            i_se = _find_col_idx(headers, ["se"])
+            i_bs = _find_col_idx(headers, ["bs"])
+            i_ba = _find_col_idx(headers, ["ba"])
+            i_re = _find_col_idx(headers, ["re"])
+
+            for tr in target_table.find_all("tr"):
+                cells = [clean(td.get_text(" ")) for td in tr.find_all("td")]
+                if len(cells) < 6 or i_name is None or i_name >= len(cells):
+                    continue
+                name = cells[i_name]
+                if not name or name.lower() in ("total", "totals", "team", "name", "player"):
+                    continue
+
+                a_el = tr.find("a", href=True)
+                p_url = urljoin(url, a_el["href"]) if a_el else url
+                team = cells[i_team] if (i_team is not None and i_team < len(cells)) else ""
+                pos = cells[i_pos] if (i_pos is not None and i_pos < len(cells)) else ""
+                yr = cells[i_yr] if (i_yr is not None and i_yr < len(cells)) else ""
+                ht = cells[i_ht] if (i_ht is not None and i_ht < len(cells)) else ""
+
+                def num(idx):
+                    return to_int(cells[idx]) if (idx is not None and idx < len(cells)) else 0
+
+                records.append(
+                    build_european_record(
+                        league=league, name=name, team=team, pos_raw=pos, class_raw=yr, height_raw=ht,
+                        matches=num(i_mp), sets=num(i_sp), kills=num(i_k), atk_err=num(i_e), atk_att=num(i_ta),
+                        aces=num(i_sa), serve_err=num(i_se), bs=num(i_bs), ba=num(i_ba),
+                        rec_tot=0, rec_err=num(i_re), profile_url=p_url,
+                    )
+                )
+            if records:
                 break
 
-        if not target_table:
-            print(f"[WARN] Could not find stats table on {url}")
-            return []
-
-        i_name = _find_col_idx(headers, ["name", "player"])
-        i_team = _find_col_idx(headers, ["team", "school"])
-        i_pos = _find_col_idx(headers, ["pos"])
-        i_yr = _find_col_idx(headers, ["yr", "cl", "year", "class"])
-        i_ht = _find_col_idx(headers, ["ht", "height"])
-        i_mp = _find_col_idx(headers, ["gp", "mp", "m"])
-        i_sp = _find_col_idx(headers, ["sp", "s", "sets"])
-        i_k = _find_col_idx(headers, ["k", "kills"])
-        i_e = _find_col_idx(headers, ["e", "err"])
-        i_ta = _find_col_idx(headers, ["ta", "att"])
-        i_sa = _find_col_idx(headers, ["sa", "ace"])
-        i_se = _find_col_idx(headers, ["se"])
-        i_bs = _find_col_idx(headers, ["bs"])
-        i_ba = _find_col_idx(headers, ["ba"])
-        i_re = _find_col_idx(headers, ["re"])
-
-        for tr in target_table.find_all("tr"):
-            cells = [clean(td.get_text(" ")) for td in tr.find_all("td")]
-            if len(cells) < 8 or i_name is None or i_name >= len(cells):
-                continue
-            name = cells[i_name]
-            if not name or name.lower() in ("total", "totals", "team"):
-                continue
-
-            a_el = tr.find("a", href=True)
-            p_url = urljoin(url, a_el["href"]) if a_el else url
-            team = cells[i_team] if (i_team is not None and i_team < len(cells)) else ""
-            pos = cells[i_pos] if (i_pos is not None and i_pos < len(cells)) else ""
-            yr = cells[i_yr] if (i_yr is not None and i_yr < len(cells)) else ""
-            ht = cells[i_ht] if (i_ht is not None and i_ht < len(cells)) else ""
-
-            def num(idx):
-                return to_int(cells[idx]) if (idx is not None and idx < len(cells)) else 0
-
-            records.append(
-                build_european_record(
-                    league=league, name=name, team=team, pos_raw=pos, class_raw=yr, height_raw=ht,
-                    matches=num(i_mp), sets=num(i_sp), kills=num(i_k), atk_err=num(i_e), atk_att=num(i_ta),
-                    aces=num(i_sa), serve_err=num(i_se), bs=num(i_bs), ba=num(i_ba),
-                    rec_tot=0, rec_err=num(i_re), profile_url=p_url, nationality="CAN",
-                )
-            )
         print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted).")
     except Exception as exc:
         print(f"[WARN] U SPORTS error ({season}): {exc}")
@@ -266,67 +304,120 @@ def scrape_usports_canada(browser, league):
 
 def scrape_ncaa_mens(browser, league):
     season = league.get("season", "2026-27")
-    url = league.get("url") or "https://stats.ncaa.org/rankings/national_ranking?academic_year=2026&division=1&sport_code=MVB"
-    records = []
+    if season != "2025-26":
+        print(f"[{league['name']} ({season})] NCAA D1 season starts in January 2027 (0 games played yet).")
+        return []
+
+    merged = {}
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
     page = ctx.new_page()
     try:
-        print(f"[{league['name']} ({season})] Opening {url}")
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(2500)
-        soup = BeautifulSoup(page.content(), "lxml")
+        for cat, base_cat_url in NCAA_COM_CATEGORIES:
+            for page_no in range(1, 5):
+                url = base_cat_url if page_no == 1 else f"{base_cat_url}/p{page_no}"
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                    if resp and resp.status >= 400:
+                        break
+                    page.wait_for_selector("table", state="attached", timeout=10000)
+                    page.wait_for_timeout(800)
+                except Exception:
+                    break
 
-        for tbl in soup.find_all("table"):
-            ths = [clean(th.get_text(" ")).lower() for th in tbl.find_all("th")]
-            if not any("player" in h or "name" in h for h in ths):
-                continue
-            i_name = _find_col_idx(ths, ["player", "name"])
-            i_team = _find_col_idx(ths, ["team"])
-            i_cl = _find_col_idx(ths, ["cl", "class", "yr"])
-            i_pos = _find_col_idx(ths, ["pos"])
-            i_ht = _find_col_idx(ths, ["ht"])
-            i_s = _find_col_idx(ths, ["s", "sets"])
-            i_k = _find_col_idx(ths, ["kills", "k"])
-            i_e = _find_col_idx(ths, ["errors", "e"])
-            i_ta = _find_col_idx(ths, ["total attacks", "ta", "att"])
-            i_sa = _find_col_idx(ths, ["aces", "sa"])
-            i_bs = _find_col_idx(ths, ["block solos", "bs"])
-            i_ba = _find_col_idx(ths, ["block assists", "ba"])
+                soup = BeautifulSoup(page.content(), "lxml")
+                tbl = soup.find("table")
+                if not tbl:
+                    break
 
-            for tr in tbl.find_all("tr"):
-                cells = [clean(td.get_text(" ")) for td in tr.find_all("td")]
-                if len(cells) < 6 or i_name is None or i_name >= len(cells):
-                    continue
-                name = cells[i_name]
-                if not name or name.lower() in ("player", "total"):
-                    continue
-                a_el = tr.find("a", href=True)
-                p_url = urljoin(url, a_el["href"]) if a_el else url
+                headers = [clean(th.get_text(" ")).lower() for th in tbl.find_all("th")]
+                i_name = _find_col_idx(headers, ["name", "player"])
+                i_team = _find_col_idx(headers, ["team"])
+                i_cl = _find_col_idx(headers, ["cl", "class", "yr"])
+                i_pos = _find_col_idx(headers, ["pos"])
+                i_ht = _find_col_idx(headers, ["ht"])
+                i_s = _find_col_idx(headers, ["s", "sets"])
+                i_k = _find_col_idx(headers, ["kills", "k"])
+                i_e = _find_col_idx(headers, ["errors", "e"])
+                i_ta = _find_col_idx(headers, ["total attacks", "ta", "att"])
+                i_sa = _find_col_idx(headers, ["aces", "sa"])
+                i_bs = _find_col_idx(headers, ["block solos", "bs"])
+                i_ba = _find_col_idx(headers, ["block assists", "ba"])
+                i_pts = _find_col_idx(headers, ["points", "pts"])
 
-                def num(idx):
-                    return to_int(cells[idx]) if (idx is not None and idx < len(cells)) else 0
+                rows_added = 0
+                for tr in tbl.find_all("tr"):
+                    cells = [clean(td.get_text(" ")) for td in tr.find_all("td")]
+                    if len(cells) < 5 or i_name is None or i_name >= len(cells):
+                        continue
+                    name = cells[i_name]
+                    if not name or name.lower() in ("name", "player", "total", "-"):
+                        continue
 
-                records.append(
-                    build_european_record(
-                        league=league,
-                        name=name,
-                        team=cells[i_team] if (i_team is not None and i_team < len(cells)) else "",
-                        pos_raw=cells[i_pos] if (i_pos is not None and i_pos < len(cells)) else "",
-                        class_raw=cells[i_cl] if (i_cl is not None and i_cl < len(cells)) else "",
-                        height_raw=cells[i_ht] if (i_ht is not None and i_ht < len(cells)) else "",
-                        matches=0, sets=num(i_s), kills=num(i_k), atk_err=num(i_e), atk_att=num(i_ta),
-                        aces=num(i_sa), serve_err=0, bs=num(i_bs), ba=num(i_ba),
-                        rec_tot=0, rec_err=0, profile_url=p_url, nationality="USA",
+                    team = cells[i_team] if (i_team is not None and i_team < len(cells)) else ""
+                    key = f"{slugify(name)}_{slugify(team)}"
+                    a_el = tr.find("a", href=True)
+                    p_url = urljoin(url, a_el["href"]) if a_el else url
+
+                    def num(idx):
+                        return to_int(cells[idx]) if (idx is not None and idx < len(cells)) else 0
+
+                    entry = merged.setdefault(
+                        key,
+                        {
+                            "name": name, "team": team, "pos": "", "cl": "", "ht": "",
+                            "sets": 0, "kills": 0, "err": 0, "att": 0, "aces": 0,
+                            "bs": 0, "ba": 0, "raw_pts": 0, "url": p_url,
+                        },
                     )
-                )
-            if records:
-                break
+                    if i_pos is not None and i_pos < len(cells) and cells[i_pos] not in ("", "-"):
+                        entry["pos"] = cells[i_pos]
+                    if i_cl is not None and i_cl < len(cells) and cells[i_cl] not in ("", "-"):
+                        entry["cl"] = cells[i_cl]
+                    if i_ht is not None and i_ht < len(cells) and cells[i_ht] not in ("", "-"):
+                        entry["ht"] = cells[i_ht]
+
+                    entry["sets"] = max(entry["sets"], num(i_s))
+                    if i_k is not None:
+                        entry["kills"] = max(entry["kills"], num(i_k))
+                    if i_e is not None:
+                        entry["err"] = max(entry["err"], num(i_e))
+                    if i_ta is not None:
+                        entry["att"] = max(entry["att"], num(i_ta))
+                    if i_sa is not None:
+                        entry["aces"] = max(entry["aces"], num(i_sa))
+                    if i_bs is not None:
+                        entry["bs"] = max(entry["bs"], num(i_bs))
+                    if i_ba is not None:
+                        entry["ba"] = max(entry["ba"], num(i_ba))
+                    if i_pts is not None:
+                        entry["raw_pts"] = max(entry["raw_pts"], num(i_pts))
+                    rows_added += 1
+
+                if rows_added == 0:
+                    break
+            print(f"[DEBUG][NCAA] {cat}: total unique players so far = {len(merged)}")
+
+        records = []
+        for e in merged.values():
+            rec = build_european_record(
+                league=league, name=e["name"], team=e["team"], pos_raw=e["pos"],
+                class_raw=e["cl"], height_raw=e["ht"], matches=0, sets=e["sets"],
+                kills=e["kills"], atk_err=e["err"], atk_att=e["att"], aces=e["aces"],
+                serve_err=0, bs=e["bs"], ba=e["ba"], rec_tot=0, rec_err=0,
+                profile_url=e["url"],
+            )
+            if rec["points"] == 0 and e["raw_pts"] > 0:
+                rec["points"] = e["raw_pts"]
+                rec["points_per_set"] = round(e["raw_pts"] / e["sets"], 2) if e["sets"] > 0 else 0.0
+            records.append(rec)
+
         print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted).")
+        return records
     except Exception as exc:
         print(f"[WARN] NCAA error ({season}): {exc}")
+        return []
     finally:
         ctx.close()
-    return records
 
 
 def scrape_college_league(browser, league):
