@@ -86,7 +86,7 @@ def estimate_graduation(class_yr, season, is_canada=False):
         return "", False
     is_25_26 = "25" in str(season) and "26" in str(season)
 
-    m_yr = re.search(r"\b([1-5])\b", c)
+    m_yr = re.search(r"(?:^|\D)([1-5])(?:\D|$)", c)
     if is_canada and m_yr:
         yr = int(m_yr.group(1))
         if is_25_26:
@@ -212,26 +212,35 @@ def _parse_vb_page(html_text):
     lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
     for i, line in enumerate(lines):
         low = line.rstrip(":").lower()
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        # Look ahead up to 3 lines because Volleybox splits "14 May" and "2004" onto separate lines
+        window = " ".join(lines[i + 1 : i + 4])
         same = line.split(":", 1)[1].strip() if ":" in line else ""
-        val = same or nxt
-        if not val:
-            continue
-        if low in ("position", "positions", "role") and not pos:
+        val = same or (lines[i + 1] if i + 1 < len(lines) else "")
+
+        if low in ("position", "positions", "role") and not pos and val:
             mapped = norm_pos(val)
             if mapped != "Unknown":
                 pos = mapped
-        elif low in ("height", "heigth") and height_cm == 0:
-            height_cm = parse_height_to_cm(val)
-        elif low in ("birthdate", "birth date", "date of birth", "born", "birthday") and birth_year == 0:
-            ym = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", val)
+        elif low in ("height", "heigth") and height_cm == 0 and (same or window):
+            height_cm = parse_height_to_cm(same or window)
+        elif (low in ("birthdate", "birth date", "date of birth", "born", "birthday") or low.startswith("birthdate ")) and birth_year == 0:
+            ym = re.search(r"\b(19[7-9]\d|20[0-1]\d)\b", f"{line} {window}")
             if ym:
                 birth_year = int(ym.group(1))
-        elif low in ("nationality", "country") and not nationality and len(val) <= 30:
+        elif low in ("nationality", "country") and not nationality and val and len(val) <= 30:
             nationality = val
 
+    full_txt = " ".join(lines)
+    if birth_year == 0:
+        m_b = re.search(
+            r"(?:birthdate|birth\s*date|date\s*of\s*birth|born)\s*[:\-]?\s*(?:[a-z0-9.,/\-\s]{0,30}?)\b(19[89]\d|200\d|201[0-2])\b",
+            full_txt,
+            re.IGNORECASE,
+        )
+        if m_b:
+            birth_year = int(m_b.group(1))
+
     if not pos:
-        full_txt = " ".join(lines)
         for k, mapped in (
             ("outside hitter", "Outside Hitter"),
             ("middle blocker", "Middle Blocker"),
@@ -292,7 +301,7 @@ def _lookup_vb_single(name):
     return {"not_found": True}
 
 
-def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
+def _enrich_college_records_from_vb(records, stat_hints=None, max_new=350):
     if not records:
         return records
 
@@ -312,7 +321,14 @@ def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
         if len(toks) < 2:
             continue
         ck = f"{'_'.join(toks)}_0"
-        if ck not in cache and ck not in to_lookup and len(to_lookup) < max_new:
+        cached_item = cache.get(ck)
+        # Re-check if not cached yet OR if cached earlier without birth_year
+        need_refresh = (cached_item is None) or (
+            isinstance(cached_item, dict)
+            and not cached_item.get("not_found")
+            and int(cached_item.get("birth_year", 0) or 0) == 0
+        )
+        if need_refresh and ck not in to_lookup and len(to_lookup) < max_new:
             to_lookup[ck] = r["name"]
 
     if to_lookup:
@@ -321,14 +337,18 @@ def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
             for fut in as_completed(futs):
                 ck = futs[fut]
                 try:
-                    cache[ck] = fut.result()
+                    res = fut.result()
+                    if res.get("not_found") and ck in cache and not cache[ck].get("not_found"):
+                        pass
+                    else:
+                        cache[ck] = res
                 except Exception:
-                    cache[ck] = {"not_found": True}
+                    pass
         os.makedirs(os.path.dirname(VB_CACHE_PATH), exist_ok=True)
         with open(VB_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
 
-    vb_hits = 0
+    vb_age_hits = 0
     for r in records:
         toks = _name_tokens(r["name"])
         ck = f"{'_'.join(toks)}_0" if len(toks) >= 2 else ""
@@ -336,13 +356,13 @@ def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
         if info and not info.get("not_found"):
             if r["position"] == "Unknown" and info.get("position"):
                 r["position"] = info["position"]
-                vb_hits += 1
             if r["height_cm"] == 0 and int(info.get("height_cm", 0)) > 0:
                 r["height_cm"] = int(info["height_cm"])
             if r["birth_year"] == 0 and int(info.get("birth_year", 0)) > 0:
                 by = int(info["birth_year"])
                 r["birth_year"] = by
                 r["age"] = datetime.now().year - by
+                vb_age_hits += 1
             if not r["nationality"] and info.get("nationality"):
                 r["nationality"] = info["nationality"]
 
@@ -359,7 +379,7 @@ def _enrich_college_records_from_vb(records, stat_hints=None, max_new=250):
             if inferred != "Unknown":
                 r["position"] = inferred
 
-    print(f"[College Volleybox] Checked {len(to_lookup)} new players, filled {vb_hits} positions from Volleybox.")
+    print(f"[College Volleybox] Checked {len(to_lookup)} players, filled {vb_age_hits} birth years/ages from Volleybox.")
     return records
 
 
@@ -456,212 +476,6 @@ def _initial_surname_key(name, team):
     return f"{slugify(team)}_{first_n[0]}_{slugify(last_n)}"
 
 
-def _parse_usports_table(soup, base_url):
-    best_rows = []
-    for tbl in soup.find_all("table"):
-        header_row, headers = None, []
-        for tr in tbl.find_all("tr")[:4]:
-            ths = [clean(c.get_text(" ")) for c in tr.find_all(["th", "td"])]
-            if len(ths) >= 3 and any("name" in _norm_hdr(h) or "player" in _norm_hdr(h) for h in ths):
-                header_row, headers = tr, ths
-                break
-        if not header_row:
-            continue
-
-        i_name = _find_col_idx(headers, ["name", "player"])
-        i_team = _find_col_idx(headers, ["team", "school"])
-        i_pos = _find_col_idx(headers, ["pos", "position"])
-        i_yr = _find_col_idx(headers, ["yr", "year", "cl", "class", "elig"])
-        i_ht = _find_col_idx(headers, ["ht", "height"])
-        i_gp = _find_col_idx(headers, ["gp", "mp", "m"])
-        i_sp = _find_col_idx(headers, ["sp", "s", "sets"])
-        i_k = _find_col_idx(headers, ["k", "kills"])
-        i_e = _find_col_idx(headers, ["e", "err", "errors"])
-        i_ta = _find_col_idx(headers, ["ta", "att", "total attacks"])
-        i_pct = _find_col_idx(headers, ["pct", "k%", "hitting"])
-        i_sa = _find_col_idx(headers, ["sa", "ace", "aces"])
-        i_se = _find_col_idx(headers, ["se"])
-        i_re = _find_col_idx(headers, ["re"])
-        i_bs = _find_col_idx(headers, ["bs", "block solos"])
-        i_ba = _find_col_idx(headers, ["ba", "block assists"])
-        i_btot = _find_col_idx(headers, ["b", "blk", "tb", "tot", "total blocks"])
-        i_pts = _find_col_idx(headers, ["pts", "points"])
-        i_ast = _find_col_idx(headers, ["a", "ast", "assists"])
-        i_dig = _find_col_idx(headers, ["d", "dig", "digs"])
-
-        rows_out = []
-        for tr in tbl.find_all("tr"):
-            if tr is header_row:
-                continue
-            tds = tr.find_all(["td", "th"])
-            cells = [clean(c.get_text(" ")) for c in tds]
-            if len(cells) < 3 or i_name is None or i_name >= len(cells):
-                continue
-            name = cells[i_name]
-            low_n = name.lower()
-            if not name or low_n in ("name", "player", "total", "totals", "team", "opponents", "opponent"):
-                continue
-
-            a_el = tds[i_name].find("a", href=True) or tr.find("a", href=re.compile(r"/players/", re.IGNORECASE))
-            p_url = urljoin(base_url, a_el["href"]) if a_el else base_url
-            team_a = tr.find("a", href=re.compile(r"/teams/", re.IGNORECASE))
-
-            gi = lambda idx: to_int(cells[idx]) if (idx is not None and idx < len(cells)) else 0
-            gf = lambda idx: to_float(cells[idx]) if (idx is not None and idx < len(cells)) else 0.0
-            gs = lambda idx: cells[idx] if (idx is not None and idx < len(cells)) else ""
-
-            rows_out.append({
-                "name": name, "slug": _player_slug_from_href(p_url),
-                "team": gs(i_team), "team_url": urljoin(base_url, team_a["href"]) if team_a else "",
-                "pos": gs(i_pos), "yr": gs(i_yr), "ht": gs(i_ht),
-                "gp": gi(i_gp), "sp": gi(i_sp), "k": gi(i_k), "e": gi(i_e), "ta": gi(i_ta),
-                "pct": gf(i_pct), "sa": gi(i_sa), "se": gi(i_se), "re": gi(i_re),
-                "bs": gi(i_bs), "ba": gi(i_ba), "btot": gf(i_btot), "pts": gf(i_pts),
-                "ast": gi(i_ast), "dig": gi(i_dig),
-                "profile_url": p_url,
-            })
-        if len(rows_out) > len(best_rows):
-            best_rows = rows_out
-    return best_rows
-
-
-def _fetch_usports_page_rows(ctx, page, url, timeout_ms=30000):
-    soup, rows = None, []
-    try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        if resp and resp.status >= 400:
-            return soup, []
-        page.wait_for_selector("table", state="attached", timeout=15000)
-        page.wait_for_timeout(1200)
-        soup = BeautifulSoup(page.content(), "lxml")
-        rows = _parse_usports_table(soup, url)
-    except Exception:
-        pass
-    return soup, rows
-
-
-def scrape_usports_canada(browser, league):
-    season = league.get("season", "2026-27")
-    main_url = league.get("url") or f"https://en.usports.ca/sports/mvball/{season}/players?sort=pts&view=lineup&pos=all"
-    teams_index_url = f"https://en.usports.ca/sports/mvball/{season}/teams"
-
-    ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
-    page = ctx.new_page()
-    merged, alias_to_key, team_urls = {}, {}, {}
-
-    def upsert_player(row, default_team="", is_roster=False):
-        team_name = row["team"] or default_team
-        slug = row["slug"]
-        isk = _initial_surname_key(row["name"], team_name)
-
-        key = slug if (slug and slug in merged) else (alias_to_key[isk] if (isk and isk in alias_to_key) else (slug or f"{slugify(row['name'])}_{slugify(team_name)}"))
-        if key not in merged:
-            merged[key] = {
-                "name": row["name"], "team": team_name, "pos": "", "yr": "", "ht": "",
-                "gp": 0, "sp": 0, "k": 0, "e": 0, "ta": 0, "pct": 0.0,
-                "sa": 0, "se": 0, "re": 0, "bs": 0, "ba": 0, "btot": 0.0, "pts": 0.0,
-                "ast": 0, "dig": 0,
-                "profile_url": row["profile_url"],
-            }
-        if isk:
-            alias_to_key.setdefault(isk, key)
-
-        cur = merged[key]
-        is_abbrev = bool(re.match(r"^[A-Z]\.?\s+", row["name"]))
-        cur_abbrev = bool(re.match(r"^[A-Z]\.?\s+", cur["name"]))
-        if (is_roster and not is_abbrev) or (cur_abbrev and not is_abbrev):
-            cur["name"] = row["name"]
-
-        for fld in ("pos", "yr", "ht"):
-            if row[fld] and not cur[fld]:
-                cur[fld] = row[fld]
-        if team_name and not cur["team"]:
-            cur["team"] = team_name
-        if "/players/" in row["profile_url"]:
-            cur["profile_url"] = row["profile_url"]
-        for fld in ("gp", "sp", "k", "e", "ta", "sa", "se", "re", "bs", "ba", "btot", "pts", "ast", "dig"):
-            cur[fld] = max(cur[fld], row[fld])
-        if row["pct"] != 0.0:
-            cur["pct"] = row["pct"]
-
-    try:
-        # 1) Load the working pos=all leaderboard URL first
-        print(f"[{league['name']} ({season})] Opening {main_url}")
-        soup_main, rows_main = _fetch_usports_page_rows(ctx, page, main_url, timeout_ms=40000)
-        print(f"[DEBUG][USPORTS {season}] main (pos=all): {len(rows_main)} rows")
-        for r in rows_main:
-            upsert_player(r)
-            if r["team_url"]:
-                bt = r["team_url"].split("?")[0].rstrip("/")
-                team_urls[bt] = r["team"] or team_urls.get(bt, "")
-
-        # Discover any additional stat category links from the page's own tabs/selects
-        extra_stat_links = []
-        if soup_main:
-            for a in soup_main.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
-                bt = urljoin(main_url, a["href"]).split("?")[0].rstrip("/")
-                team_urls.setdefault(bt, clean(a.get_text(" ")))
-            for el in soup_main.find_all(["a", "option"]):
-                ref = clean(el.get("href") or el.get("value"))
-                if f"/sports/mvball/{season}/players" in ref and ("pos=" in ref or "sort=" in ref):
-                    full_l = urljoin(main_url, ref)
-                    if full_l != main_url and full_l not in extra_stat_links:
-                        extra_stat_links.append(full_l)
-
-        for ex_url in extra_stat_links[:4]:
-            _, rows_ex = _fetch_usports_page_rows(ctx, page, ex_url, timeout_ms=25000)
-            for r in rows_ex:
-                upsert_player(r)
-
-        # 2) Discover all Canadian teams from /teams index
-        soup_t, _ = _fetch_usports_page_rows(ctx, page, teams_index_url, timeout_ms=25000)
-        if soup_t:
-            for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
-                bt = urljoin(teams_index_url, a["href"]).split("?")[0].rstrip("/")
-                lbl = clean(a.get_text(" "))
-                if bt not in team_urls or (lbl and not team_urls[bt]):
-                    team_urls[bt] = lbl
-
-        # 3) Visit each team's roster (?view=roster) & full team stats (?view=lineup)
-        print(f"[DEBUG][USPORTS {season}] Visiting {len(team_urls)} team rosters & stats...")
-        for t_url, t_name in list(team_urls.items()):
-            soup_r, rows_r = _fetch_usports_page_rows(ctx, page, f"{t_url}?view=roster", timeout_ms=20000)
-            if soup_r and not t_name and soup_r.find("h1"):
-                t_name = clean(soup_r.find("h1").get_text(" "))
-            for r in rows_r:
-                upsert_player(r, default_team=t_name, is_roster=True)
-
-            _, rows_ts = _fetch_usports_page_rows(ctx, page, f"{t_url}?view=lineup", timeout_ms=20000)
-            for r in rows_ts:
-                upsert_player(r, default_team=t_name, is_roster=False)
-
-        records = []
-        stat_hints = {}
-        for p in merged.values():
-            if p["sp"] == 0 and p["pts"] == 0 and p["k"] == 0:
-                continue
-            rec = build_european_record(
-                league=league, name=p["name"], team=p["team"], pos_raw=p["pos"],
-                class_raw=p["yr"], height_raw=p["ht"], matches=p["gp"], sets=p["sp"],
-                kills=p["k"], atk_err=p["e"], atk_att=p["ta"], aces=p["sa"],
-                serve_err=p["se"], bs=p["bs"], ba=p["ba"], rec_tot=0, rec_err=p["re"],
-                profile_url=p["profile_url"], raw_pts=p["pts"], raw_hit_pct=p["pct"],
-                raw_total_blocks=p["btot"],
-            )
-            stat_hints[rec["player_id"]] = {"assists": p["ast"], "digs": p["dig"]}
-            records.append(rec)
-
-        records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=150)
-        grad_cnt = sum(1 for r in records if r["grad_2027"])
-        print(f"[{league['name']} ({season})] Scraped {len(records)} players (EU-converted, {grad_cnt} graduating Summer 2027).")
-        return records
-    except Exception as exc:
-        print(f"[WARN] U SPORTS error ({season}): {exc}")
-        return []
-    finally:
-        ctx.close()
-
-
 def _discover_ncaa_categories(soup, base_url):
     wanted = {
         "points": ["points per set", "points"],
@@ -711,8 +525,7 @@ def scrape_ncaa_mens(browser, league):
             if os.path.exists(NCAA_25_26_CACHE):
                 with open(NCAA_25_26_CACHE, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                print(f"[{league['name']} ({season})] Loaded {len(cached)} players from saved 2025-26 archive.")
-                return cached
+                return _enrich_college_records_from_vb(cached, max_new=350)
             return []
 
         categories = _discover_ncaa_categories(soup_idx, index_url) if soup_idx else NCAA_FALLBACK_CATEGORIES
@@ -819,8 +632,6 @@ def scrape_ncaa_mens(browser, league):
 
 def scrape_college_league(browser, league):
     ltype = league.get("type", "")
-    if ltype == "usports_ca":
-        return scrape_usports_canada(browser, league)
     if ltype == "ncaa_us":
         return scrape_ncaa_mens(browser, league)
     return []
