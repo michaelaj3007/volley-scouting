@@ -12,8 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from college_scraper import scrape_college_league
 from canada_scraper import scrape_canada_usports
+from college_scraper import scrape_college_league
 from czech_scraper import scrape_cvf_cz_league
 from volleybox_enricher import enrich_missing_bios_from_volleybox
 
@@ -540,11 +540,11 @@ def main():
                     all_records.extend(recs)
                     continue
                 if ltype == "usports_ca":
-                 all_records.extend(scrape_canada_usports(browser, league))
-                 continue
-             if ltype == "ncaa_us":
-                 all_records.extend(scrape_college_league(browser, league))
-                 continue
+                    all_records.extend(scrape_canada_usports(browser, league))
+                    continue
+                if ltype == "ncaa_us":
+                    all_records.extend(scrape_college_league(browser, league))
+                    continue
 
                 cand_urls = resolve_dataproject_stats_urls(session, league)
                 players = scrape_all_players_playwright(browser, league, cand_urls)
