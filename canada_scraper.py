@@ -290,4 +290,103 @@ def scrape_canada_usports(browser, league):
             merged[key] = {
                 "name": row["name"], "team": team_name, "pos": "", "yr": "", "ht": "",
                 "gp": 0, "sp": 0, "k": 0, "e": 0, "ta": 0, "pct": 0.0,
-                "sa": 0, "se
+                "sa": 0, "se": 0, "re": 0, "bs": 0, "ba": 0, "btot": 0.0, "pts": 0.0,
+                "ast": 0, "dig": 0,
+                "profile_url": row["profile_url"],
+            }
+        for ak in akeys:
+            alias_to_key.setdefault(ak, key)
+
+        cur = merged[key]
+        is_abbrev = bool(re.match(r"^[A-Z]\.?\s+", row["name"]))
+        cur_abbrev = bool(re.match(r"^[A-Z]\.?\s+", cur["name"]))
+        if (is_roster and not is_abbrev) or (cur_abbrev and not is_abbrev):
+            cur["name"] = row["name"]
+
+        for fld in ("pos", "yr", "ht"):
+            if row[fld] and not cur[fld]:
+                cur[fld] = row[fld]
+        if team_name and not cur["team"]:
+            cur["team"] = team_name
+        if "/players/" in row["profile_url"]:
+            cur["profile_url"] = row["profile_url"]
+        for fld in ("gp", "sp", "k", "e", "ta", "sa", "se", "re", "bs", "ba", "btot", "pts", "ast", "dig"):
+            cur[fld] = max(cur[fld], row[fld])
+        if row["pct"] != 0.0:
+            cur["pct"] = row["pct"]
+
+    records = []
+    try:
+        soup_main = None
+        for m_url in main_candidates:
+            print(f"[{league['name']} ({season})] Fetching {m_url}")
+            soup_main, rows_main = _fetch_usports_soup_and_rows(session, page, m_url)
+            print(f"[DEBUG][CANADA {season}] {m_url} -> {len(rows_main)} players")
+            if rows_main:
+                if "en.usports.ca" in m_url:
+                    active_host = "https://en.usports.ca"
+                for r in rows_main:
+                    upsert_player(r)
+                    if r["team_url"]:
+                        bt = r["team_url"].split("?")[0].rstrip("/")
+                        team_urls[bt] = r["team"] or team_urls.get(bt, "")
+                break
+
+        if soup_main:
+            for a in soup_main.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
+                bt = urljoin(active_host + "/", a["href"]).split("?")[0].rstrip("/")
+                team_urls.setdefault(bt, clean(a.get_text(" ")))
+
+        if not team_urls:
+            teams_index_url = f"{active_host}/sports/mvball/{season}/teams"
+            soup_t, _ = _fetch_usports_soup_and_rows(session, page, teams_index_url)
+            if soup_t:
+                for a in soup_t.find_all("a", href=re.compile(rf"/sports/mvball/{re.escape(season)}/teams/[a-z0-9_\-]+", re.IGNORECASE)):
+                    bt = urljoin(teams_index_url, a["href"]).split("?")[0].rstrip("/")
+                    lbl = clean(a.get_text(" "))
+                    if bt not in team_urls or (lbl and not team_urls[bt]):
+                        team_urls[bt] = lbl
+
+        print(f"[DEBUG][CANADA {season}] Found {len(team_urls)} teams. Reading rosters for Yr/Pos/Ht/Full Name...")
+        for t_url, t_name in list(team_urls.items()):
+            time.sleep(0.25)
+            soup_r, rows_r = _fetch_usports_soup_and_rows(session, page, f"{t_url}?view=roster", allow_card_roster=True)
+            if soup_r and not t_name and soup_r.find("h1"):
+                t_name = clean(soup_r.find("h1").get_text(" "))
+            for r in rows_r:
+                upsert_player(r, default_team=t_name, is_roster=True)
+
+        stat_hints = {}
+        for p in merged.values():
+            if p["sp"] == 0 and p["pts"] == 0 and p["k"] == 0:
+                continue
+            rec = build_european_record(
+                league=league, name=p["name"], team=p["team"], pos_raw=p["pos"],
+                class_raw=p["yr"], height_raw=p["ht"], matches=p["gp"], sets=p["sp"],
+                kills=p["k"], atk_err=p["e"], atk_att=p["ta"], aces=p["sa"],
+                serve_err=p["se"], bs=p["bs"], ba=p["ba"], rec_tot=0, rec_err=p["re"],
+                profile_url=p["profile_url"], raw_pts=p["pts"], raw_hit_pct=p["pct"],
+                raw_total_blocks=p["btot"],
+            )
+            stat_hints[rec["player_id"]] = {"assists": p["ast"], "digs": p["dig"]}
+            records.append(rec)
+
+        if records:
+            records = _enrich_college_records_from_vb(records, stat_hints=stat_hints, max_new=200)
+            _save_canada_cache(season, records)
+            grad_cnt = sum(1 for r in records if r["grad_2027"])
+            print(f"[{league['name']} ({season})] Scraped & cached {len(records)} Canadian players ({grad_cnt} graduating Summer 2027).")
+        else:
+            cached = _load_canada_cache(season)
+            if cached:
+                records = _enrich_college_records_from_vb(cached, max_new=200)
+                print(f"[{league['name']} ({season})] Loaded {len(records)} Canadian players from local cache.")
+    except Exception as exc:
+        print(f"[WARN] Canada U SPORTS error ({season}): {exc}")
+        cached = _load_canada_cache(season)
+        if cached:
+            records = cached
+    finally:
+        ctx.close()
+
+    return records
