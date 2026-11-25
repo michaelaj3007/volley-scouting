@@ -348,63 +348,95 @@ def _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0):
     return None
 
 
-def _trigger_radgrid_next(page, strategy):
-    js = """(strategy) => {
-        const grids = Array.from(document.querySelectorAll('.RadGrid'));
-        let bestGrid = document;
-        let maxRows = -1;
-        for (const g of grids) {
-            const cnt = g.querySelectorAll('tr.rgRow, tr.rgAltRow').length;
-            if (cnt > maxRows) {
-                maxRows = cnt;
-                bestGrid = g;
-            }
-        }
+def _dismiss_overlays(page):
+    for sel in (
+        "button:has-text('Accept')", "button:has-text('Hyväksy')", "button:has-text('OK')",
+        "button:has-text('Agree')", "[id*='cookie'] button", ".cc-dismiss", ".cc-allow",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=1500)
+                page.wait_for_timeout(300)
+                break
+        except Exception:
+            pass
 
-        if (strategy === 'next_btn') {
-            const btns = bestGrid.querySelectorAll('input.rgPageNext, button.rgPageNext, a.rgPageNext');
-            for (const btn of btns) {
-                const oc = (btn.getAttribute('onclick') || '').trim();
-                const isDisabled = Boolean(
-                    btn.disabled
-                    || btn.classList.contains('rgDisabled')
-                    || /^return\\s+false\\s*;?$/i.test(oc)
-                );
-                if (!isDisabled) {
-                    btn.click();
-                    return 'clicked';
-                }
-            }
-            return 'none';
-        }
 
-        if (strategy === 'num_next') {
-            const cur = bestGrid.querySelector('.rgNumPart a.rgCurrentPage');
-            if (cur && cur.nextElementSibling && cur.nextElementSibling.tagName === 'A') {
-                cur.nextElementSibling.click();
-                return 'clicked';
-            }
-            return 'none';
-        }
-
-        if (strategy === 'telerik_api') {
-            if (typeof $find !== 'function' || bestGrid === document || !bestGrid.id) return 'none';
-            const ctrl = $find(bestGrid.id);
-            if (!ctrl || typeof ctrl.get_masterTableView !== 'function') return 'none';
-            const mtv = ctrl.get_masterTableView();
-            const pc = typeof mtv.get_pageCount === 'function' ? mtv.get_pageCount() : 0;
-            const pi = typeof mtv.get_currentPageIndex === 'function' ? mtv.get_currentPageIndex() : 0;
-            if (pc > 0 && pi >= pc - 1) return 'last';
-            mtv.page('Next');
-            return 'clicked';
-        }
-
-        return 'none';
-    }"""
+def _click_radgrid_next(page, target_page_num, strategy):
     try:
-        return page.evaluate(js, strategy)
+        if strategy == "num_link":
+            # Look for exact page number (e.g. "2", "3"...) or "..." next-block link inside pager
+            links = page.locator(".rgNumPart a, .rgPager a")
+            cnt = links.count()
+            target_str = str(target_page_num)
+            ellipsis_after = None
+            passed_prev = False
+            for i in range(cnt):
+                a = links.nth(i)
+                txt = clean_text(a.inner_text() if a.count() else "")
+                if txt == str(target_page_num - 1):
+                    passed_prev = True
+                if txt == target_str:
+                    a.click(force=True, timeout=4000)
+                    return True
+                if passed_prev and txt == "..." and ellipsis_after is None:
+                    ellipsis_after = a
+            if ellipsis_after is not None:
+                ellipsis_after.click(force=True, timeout=4000)
+                return True
+            return False
+
+        if strategy == "next_btn_real":
+            btns = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page'], [title='Seuraava sivu']")
+            for i in range(btns.count()):
+                b = btns.nth(i)
+                is_dis = b.evaluate("el => Boolean(el.disabled || el.classList.contains('rgDisabled') || el.classList.contains('aspNetDisabled'))")
+                if not is_dis:
+                    b.click(force=True, timeout=4000)
+                    return True
+            return False
+
+        if strategy == "dopostback":
+            return bool(page.evaluate(
+                """(targetStr) => {
+                    const links = Array.from(document.querySelectorAll('.rgNumPart a, .rgPager a'));
+                    for (const a of links) {
+                        if ((a.textContent || '').trim() === targetStr) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(/__doPostBack\\(['"]([^'"]+)['"]\\s*,\\s*['"]([^'"]*)['"]\\)/);
+                            if (m && typeof __doPostBack === 'function') {
+                                __doPostBack(m[1], m[2]);
+                                return true;
+                            }
+                            a.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                str(target_page_num),
+            ))
+
+        if strategy == "telerik_api":
+            return bool(page.evaluate(
+                """() => {
+                    if (typeof $find !== 'function') return false;
+                    let bestGrid = null, maxRows = -1;
+                    for (const g of document.querySelectorAll('.RadGrid')) {
+                        const c = g.querySelectorAll('tr.rgRow, tr.rgAltRow').length;
+                        if (c > maxRows && g.id) { maxRows = c; bestGrid = g; }
+                    }
+                    if (!bestGrid) return false;
+                    const ctrl = $find(bestGrid.id);
+                    if (!ctrl || typeof ctrl.get_masterTableView !== 'function') return false;
+                    ctrl.get_masterTableView().page('Next');
+                    return true;
+                }"""
+            ))
     except Exception:
-        return "error"
+        return False
+    return False
 
 
 def scrape_all_players_playwright(browser, league, candidate_urls):
@@ -421,6 +453,7 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
                     timeout=20000,
                 )
                 page.wait_for_timeout(800)
+                _dismiss_overlays(page)
             except Exception:
                 continue
 
@@ -439,13 +472,10 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
                     break
 
                 next_batch = None
-                for strategy in ("next_btn", "num_next", "telerik_api"):
-                    res = _trigger_radgrid_next(page, strategy)
-                    if res == "last":
-                        next_batch = None
-                        break
-                    if res == "clicked":
-                        cand = _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0)
+                target_num = pages_scraped + 1
+                for strategy in ("num_link", "next_btn_real", "dopostback", "telerik_api"):
+                    if _click_radgrid_next(page, target_num, strategy):
+                        cand = _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=10.0)
                         if cand and any(k not in all_players for k in cand):
                             next_batch = cand
                             break
@@ -459,6 +489,152 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
     finally:
         context.close()
     return all_players
+
+
+def _detect_ranking_category(title_text, headers):
+    # Decide which stat category a BestPlayerRankingComplete.aspx?rt=X page represents
+    blob = normalize_header(f"{title_text} {' '.join(headers)}")
+    h_join = " ".join(headers)
+
+    if any(k in blob for k in ["recep", "vastaa", "υποδοχ", "preluar", "mottagn", "fogad", "prijem", "посрещ"]):
+        return "reception"
+    if any(k in blob for k in ["block", "torjun", "μπλοκ", "blocaj", "sanc", "blok", "блок"]):
+        return "block"
+    if any(k in blob for k in ["ace", "serve", "assat", "syot", "ασοι", "σερβ", "servici", "ess", "asz", "nyit", "asov", "асов", "серв", "esa", "podan"]):
+        return "serve"
+    if any(k in blob for k in ["attack", "spik", "kill", "hyok", "επιθ", "atac", "anfall", "tamad", "napad", "атак", "utok"]):
+        return "attack"
+    if any(k in blob for k in ["scorer", "point", "piste", "ποντ", "punct", "poang", "pont", "poen", "bod", "точк", "body"]) or "pts" in h_join:
+        return "points"
+    return ""
+
+
+def scrape_best_player_rankings(session, league, existing_players):
+    # Backup & supplement via BestPlayerRankingComplete.aspx?ID={cid}&rt=1..8
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
+    added_or_filled = 0
+
+    for rt in range(1, 9):
+        url = f"{base}/BestPlayerRankingComplete.aspx?ID={cid}&rt={rt}"
+        raw_html = fetch_html(session, url, timeout=20)
+        if not raw_html or "PlayerID=" not in raw_html:
+            continue
+
+        soup = BeautifulSoup(raw_html, "lxml")
+        title_els = soup.select("h1, h2, h3, [id*='Title'], [id*='LBL_Ranking'], [class*='Title']")
+        title_txt = " ".join(clean_text(el.get_text(" ")) for el in title_els[:5])
+
+        for tbl in soup.find_all("table"):
+            player_links = tbl.find_all("a", href=re.compile(r"PlayerID=\d+", re.IGNORECASE))
+            if len(player_links) < 5:
+                continue
+
+            trs = tbl.find_all("tr")
+            header_idx, headers = 0, []
+            for idx, tr in enumerate(trs[:4]):
+                ths = [normalize_header(c.get_text(" ")) for c in tr.find_all(["th", "td"])]
+                if len(ths) >= 4:
+                    header_idx, headers = idx, ths
+                    break
+
+            cat = _detect_ranking_category(title_txt, headers)
+            if not cat:
+                continue
+
+            i_team = find_col(headers, ["team", "club", "joukkue", "seura", "ομαδα", "echipa", "lag", "csapat", "klub", "отбор", "ekipa"])
+            i_matches = find_col(headers, ["matches", "ottelut", "αγωνες", "meciuri", "matcher", "meccs", "utakmice", "мачове", "zapasy", "m"])
+            i_sets = find_col(headers, ["sets", "erat", "σετ", "seturi", "set", "szett", "setovi", "геймове", "sety", "s"])
+            i_pct = next((i for i, h in enumerate(headers) if "%" in h or "pct" in h or "exc" in h or "pos" in h), None)
+
+            for tr in trs[header_idx + 1 :]:
+                a_el = tr.find("a", href=re.compile(r"PlayerID=\d+", re.IGNORECASE))
+                if not a_el:
+                    continue
+                full_p_url = urljoin(base + "/", a_el["href"])
+                pl_id = extract_query_param(full_p_url, "PlayerID")
+                if not pl_id:
+                    continue
+
+                cells = [clean_text(c.get_text(" ")) for c in tr.find_all(["td", "th"])]
+                if len(cells) < 4:
+                    continue
+
+                name = clean_text(a_el.get_text(" "))
+                team = cell_val(cells, i_team)
+
+                # Extract numeric columns (after player & team)
+                nums = []
+                for ci, val in enumerate(cells):
+                    if ci in (0, i_team, i_matches, i_sets):
+                        continue
+                    if re.search(r"\d", val) and val != name and val != team:
+                        is_pct_cell = "%" in val or (ci == i_pct)
+                        is_float_cell = ("," in val or "." in val) and not is_pct_cell
+                        nums.append((ci, to_float(val), is_pct_cell, is_float_cell))
+
+                if pl_id not in existing_players:
+                    existing_players[pl_id] = {
+                        "pl_id": pl_id, "url": full_p_url, "name": name, "team": team, "country": "",
+                        "matches": 0, "sets": 0, "points": 0, "break_points": 0, "won_lost": 0,
+                        "serve_total": 0, "aces": 0, "serve_errors": 0,
+                        "reception_total": 0, "reception_pos_pct": 0.0, "reception_perf_pct": 0.0,
+                        "attack_total": 0, "attack_points": 0, "attack_errors": 0, "attack_blocked": 0,
+                        "attack_pct": 0.0, "attack_eff_pct": 0.0, "blocks": 0,
+                    }
+                    added_or_filled += 1
+
+                rec = existing_players[pl_id]
+                if not rec["name"] and name:
+                    rec["name"] = name
+                if not rec["team"] and team:
+                    rec["team"] = team
+
+                m_val = to_int(cell_val(cells, i_matches))
+                s_val = to_int(cell_val(cells, i_sets))
+                if m_val > rec["matches"]:
+                    rec["matches"] = m_val
+                if s_val > rec["sets"]:
+                    rec["sets"] = s_val
+
+                # Fill missing category stats without overwriting complete RadGrid data
+                int_vals = [int(round(v)) for _, v, is_p, is_f in nums if not is_p and not is_f and v >= 0]
+                pct_vals = [round(v, 1) for _, v, is_p, _ in nums if is_p and 0 <= v <= 100]
+
+                if cat == "points" and rec["points"] == 0 and int_vals:
+                    rec["points"] = max(int_vals)
+                elif cat == "serve" and rec["aces"] == 0 and int_vals:
+                    rec["aces"] = min(int_vals) if len(int_vals) >= 2 and max(int_vals) > 5 * min(int_vals) else max(int_vals)
+                    if len(int_vals) >= 2 and max(int_vals) > rec["aces"]:
+                        rec["serve_total"] = max(rec["serve_total"], max(int_vals))
+                elif cat == "block" and rec["blocks"] == 0 and int_vals:
+                    rec["blocks"] = max(int_vals)
+                elif cat == "attack":
+                    if rec["attack_pct"] == 0.0 and pct_vals:
+                        rec["attack_pct"] = pct_vals[0]
+                    if rec["attack_total"] == 0 and len(int_vals) >= 2:
+                        rec["attack_total"] = max(int_vals)
+                        rec["attack_points"] = sorted(int_vals)[-2] if sorted(int_vals)[-2] <= rec["attack_total"] else 0
+                    elif rec["attack_points"] == 0 and int_vals:
+                        rec["attack_points"] = max(int_vals)
+                elif cat == "reception":
+                    if rec["reception_pos_pct"] == 0.0 and pct_vals:
+                        rec["reception_pos_pct"] = pct_vals[0]
+                        if len(pct_vals) >= 2:
+                            rec["reception_perf_pct"] = pct_vals[1]
+                    if rec["reception_total"] == 0 and int_vals:
+                        rec["reception_total"] = max(int_vals)
+            break
+
+    # Backfill total points if components exist
+    for rec in existing_players.values():
+        calc_pts = rec["attack_points"] + rec["aces"] + rec["blocks"]
+        if calc_pts > rec["points"]:
+            rec["points"] = calc_pts
+
+    if added_or_filled > 0:
+        print(f"[{league['name']}] BestPlayerRankingComplete (rt=1..8) added/filled {added_or_filled} players.")
+    return existing_players
 
 
 def discover_extra_players_from_teams(session, league, existing_players):
@@ -650,6 +826,7 @@ def main():
 
                 cand_urls = resolve_dataproject_stats_urls(session, league)
                 players = scrape_all_players_playwright(browser, league, cand_urls)
+                players = scrape_best_player_rankings(session, league, players)
                 players = discover_extra_players_from_teams(session, league, players)
 
                 with ThreadPoolExecutor(max_workers=12) as executor:
