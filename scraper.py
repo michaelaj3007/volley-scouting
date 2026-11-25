@@ -2,6 +2,7 @@ import html
 import json
 import os
 import re
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -24,6 +25,14 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+}
+
+EXACT_ROLE_MAP = {
+    "s": "Setter", "p": "Setter", "set": "Setter",
+    "opp": "Opposite", "op": "Opposite", "rs": "Opposite", "u": "Opposite", "d": "Opposite",
+    "oh": "Outside Hitter", "ws": "Outside Hitter", "ls": "Outside Hitter", "os": "Outside Hitter",
+    "m": "Middle Blocker", "mb": "Middle Blocker", "mh": "Middle Blocker", "c": "Middle Blocker",
+    "l": "Libero", "lb": "Libero", "lib": "Libero", "ds": "Libero", "l/ds": "Libero",
 }
 
 ROLE_MAP = {
@@ -101,11 +110,20 @@ def to_int(val):
 
 
 def normalize_position(raw):
-    low = clean_text(raw).lower()
+    cleaned = clean_text(raw)
+    if not cleaned:
+        return "Unknown"
+    low = cleaned.lower().replace(".", "").strip()
+    if low in EXACT_ROLE_MAP:
+        return EXACT_ROLE_MAP[low]
+    for part in re.split(r"[/,\-]", low):
+        p = part.strip()
+        if p in EXACT_ROLE_MAP:
+            return EXACT_ROLE_MAP[p]
     for key, mapped in ROLE_MAP.items():
         if key in low:
             return mapped
-    return clean_text(raw) if clean_text(raw) else "Unknown"
+    return cleaned
 
 
 def first_bio(bio, keys):
@@ -166,6 +184,7 @@ def resolve_dataproject_stats_urls(session, league):
 def parse_radgrid_page(soup, league):
     base = league["base_url"].rstrip("/")
     cid = str(league["competition_id"])
+    target_table = None
     headers = []
     for table in soup.find_all("table"):
         for tr in table.find_all("tr")[:5]:
@@ -173,6 +192,7 @@ def parse_radgrid_page(soup, league):
             h_ns = [c.replace(" ", "") for c in h_cells]
             if "playerid" in h_ns or sum(1 for c in h_ns if c.endswith("#")) >= 3:
                 headers = h_cells
+                target_table = table
                 break
         if headers:
             break
@@ -228,7 +248,10 @@ def parse_radgrid_page(soup, league):
     i_bp = find_col(headers, ["bp", "break points"], meta_start, meta_end)
     i_wl = find_col(headers, ["w-p", "w-l", "wl", "v-p", "+/-"], meta_start, meta_end)
 
-    data_rows = soup.select("tr.rgRow, tr.rgAltRow")
+    data_rows = target_table.select("tr.rgRow, tr.rgAltRow") if target_table else []
+    if not data_rows:
+        data_rows = soup.select("tr.rgRow, tr.rgAltRow")
+
     if i_s_err is not None and data_rows:
         if i_points is None:
             best_col, best_hits = None, 0
@@ -297,6 +320,93 @@ def parse_radgrid_page(soup, league):
     return page_players
 
 
+def _safe_page_content(page):
+    for _ in range(5):
+        try:
+            return page.content()
+        except Exception:
+            time.sleep(0.4)
+    return ""
+
+
+def _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            pass
+        html_now = _safe_page_content(page)
+        if not html_now:
+            continue
+        cand = parse_radgrid_page(BeautifulSoup(html_now, "lxml"), league)
+        if cand:
+            cand_ids = set(cand.keys())
+            if cand_ids != prev_ids and len(cand_ids - prev_ids) > 0:
+                return cand
+    return None
+
+
+def _trigger_radgrid_next(page, strategy):
+    js = """(strategy) => {
+        const grids = Array.from(document.querySelectorAll('.RadGrid'));
+        let bestGrid = document;
+        let maxRows = -1;
+        for (const g of grids) {
+            const cnt = g.querySelectorAll('tr.rgRow, tr.rgAltRow').length;
+            if (cnt > maxRows) {
+                maxRows = cnt;
+                bestGrid = g;
+            }
+        }
+
+        if (strategy === 'next_btn') {
+            const btns = bestGrid.querySelectorAll('input.rgPageNext, button.rgPageNext, a.rgPageNext');
+            for (const btn of btns) {
+                const oc = (btn.getAttribute('onclick') || '').trim();
+                const isDisabled = Boolean(
+                    btn.disabled
+                    || btn.classList.contains('rgDisabled')
+                    || /^return\\s+false\\s*;?$/i.test(oc)
+                );
+                if (!isDisabled) {
+                    btn.click();
+                    return 'clicked';
+                }
+            }
+            return 'none';
+        }
+
+        if (strategy === 'num_next') {
+            const cur = bestGrid.querySelector('.rgNumPart a.rgCurrentPage');
+            if (cur && cur.nextElementSibling && cur.nextElementSibling.tagName === 'A') {
+                cur.nextElementSibling.click();
+                return 'clicked';
+            }
+            return 'none';
+        }
+
+        if (strategy === 'telerik_api') {
+            if (typeof $find !== 'function' || bestGrid === document || !bestGrid.id) return 'none';
+            const ctrl = $find(bestGrid.id);
+            if (!ctrl || typeof ctrl.get_masterTableView !== 'function') return 'none';
+            const mtv = ctrl.get_masterTableView();
+            const pc = typeof mtv.get_pageCount === 'function' ? mtv.get_pageCount() : 0;
+            const pi = typeof mtv.get_currentPageIndex === 'function' ? mtv.get_currentPageIndex() : 0;
+            if (pc > 0 && pi >= pc - 1) return 'last';
+            mtv.page('Next');
+            return 'clicked';
+        }
+
+        return 'none';
+    }"""
+    try:
+        return page.evaluate(js, strategy)
+    except Exception:
+        return "error"
+
+
 def scrape_all_players_playwright(browser, league, candidate_urls):
     all_players = {}
     context = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=HEADERS["User-Agent"])
@@ -305,54 +415,46 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
         for url in candidate_urls:
             print(f"[{league['name']}] Opening browser on {url}")
             try:
-                page.goto(url, wait_until="networkidle", timeout=45000)
-                page.wait_for_function("""() => Array.from(document.querySelectorAll('tr.rgRow, tr.rgAltRow')).some(r => (r.textContent || '').trim().length > 10)""", timeout=18000)
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_function(
+                    """() => Array.from(document.querySelectorAll('tr.rgRow, tr.rgAltRow')).some(r => r.querySelectorAll('td').length >= 10)""",
+                    timeout=20000,
+                )
+                page.wait_for_timeout(800)
             except Exception:
                 continue
 
-            prev_sig = None
-            for _ in range(60):
-                batch = parse_radgrid_page(BeautifulSoup(page.content(), "lxml"), league)
-                if not batch:
-                    break
-                curr_sig = tuple(list(batch.keys())[:3])
-                if curr_sig == prev_sig:
-                    break
-                prev_sig = curr_sig
+            html_first = _safe_page_content(page)
+            batch = parse_radgrid_page(BeautifulSoup(html_first, "lxml"), league) if html_first else {}
+            if not batch:
+                continue
+
+            pages_scraped = 0
+            for _ in range(100):
+                pages_scraped += 1
+                prev_ids = set(batch.keys())
                 new_count = sum(1 for k in batch if k not in all_players)
                 all_players.update(batch)
-                if new_count == 0:
+                if pages_scraped > 1 and new_count == 0:
                     break
 
-                prev_first = page.evaluate("() => { const r = document.querySelector('tr.rgRow'); return r ? r.textContent.trim() : ''; }")
-                status = page.evaluate(
-                    """() => {
-                        if (typeof $find !== 'function') return 'no_find';
-                        for (const g of document.querySelectorAll('.RadGrid')) {
-                            const ctrl = g.id ? $find(g.id) : null;
-                            if (ctrl && typeof ctrl.get_masterTableView === 'function') {
-                                const mtv = ctrl.get_masterTableView();
-                                if (mtv.get_pageCount() > 0 && mtv.get_currentPageIndex() >= mtv.get_pageCount() - 1) return 'last';
-                                mtv.page('Next');
-                                return 'paged';
-                            }
-                        }
-                        return 'no_grid';
-                    }"""
-                )
-                if status == "last":
-                    break
-                if status != "paged":
-                    btn = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page']").first
-                    if btn.count() == 0 or btn.evaluate("el => Boolean(el.disabled || el.classList.contains('rgDisabled'))"):
+                next_batch = None
+                for strategy in ("next_btn", "num_next", "telerik_api"):
+                    res = _trigger_radgrid_next(page, strategy)
+                    if res == "last":
+                        next_batch = None
                         break
-                    btn.click(force=True)
-                try:
-                    page.wait_for_function("""(prev) => { const r = document.querySelector('tr.rgRow'); const c = r ? r.textContent.trim() : ''; return c.length > 10 && c !== prev; }""", arg=prev_first, timeout=12000)
-                except Exception:
+                    if res == "clicked":
+                        cand = _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0)
+                        if cand and any(k not in all_players for k in cand):
+                            next_batch = cand
+                            break
+                if not next_batch:
                     break
+                batch = next_batch
+
             if all_players:
-                print(f"[{league['name']}] Browser scraped {len(all_players)} players with full stats.")
+                print(f"[{league['name']}] Browser scraped {len(all_players)} players with full stats across {pages_scraped} pages.")
                 break
     finally:
         context.close()
@@ -563,8 +665,10 @@ def main():
     df = pd.DataFrame(all_records)
     if not df.empty:
         df = df.drop_duplicates(subset=["player_id"], keep="first")
+        df["position"] = df["position"].apply(normalize_position)
         df = df.sort_values(by=["points", "name"], ascending=[False, True])
         df = enrich_missing_bios_from_volleybox(df, max_new_lookups=450)
+        df["position"] = df["position"].apply(normalize_position)
         df = apply_manual_overrides(df)
 
     df.to_csv("data/players.csv", index=False, encoding="utf-8-sig")
