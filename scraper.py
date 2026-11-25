@@ -94,6 +94,17 @@ def strip_accents(text):
     return "".join(ch for ch in norm if not unicodedata.combining(ch))
 
 
+def name_match_key(name):
+    ascii_n = strip_accents(clean_text(name)).lower()
+    tokens = [t for t in re.sub(r"[^a-z0-9\s]", " ", ascii_n).split() if t]
+    return tuple(sorted(tokens))
+
+
+def slugify_text(text):
+    ascii_n = strip_accents(clean_text(text)).lower()
+    return re.sub(r"[^a-z0-9]+", "_", ascii_n).strip("_") or "unknown"
+
+
 def to_float(val):
     if val is None:
         return 0.0
@@ -329,14 +340,10 @@ def _safe_page_content(page):
     return ""
 
 
-def _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0):
+def _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=10.0):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         time.sleep(0.5)
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=3000)
-        except Exception:
-            pass
         html_now = _safe_page_content(page)
         if not html_now:
             continue
@@ -348,25 +355,9 @@ def _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=12.0):
     return None
 
 
-def _dismiss_overlays(page):
-    for sel in (
-        "button:has-text('Accept')", "button:has-text('Hyväksy')", "button:has-text('OK')",
-        "button:has-text('Agree')", "[id*='cookie'] button", ".cc-dismiss", ".cc-allow",
-    ):
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible():
-                loc.click(timeout=1500)
-                page.wait_for_timeout(300)
-                break
-        except Exception:
-            pass
-
-
 def _click_radgrid_next(page, target_page_num, strategy):
     try:
         if strategy == "num_link":
-            # Look for exact page number (e.g. "2", "3"...) or "..." next-block link inside pager
             links = page.locator(".rgNumPart a, .rgPager a")
             cnt = links.count()
             target_str = str(target_page_num)
@@ -388,7 +379,7 @@ def _click_radgrid_next(page, target_page_num, strategy):
             return False
 
         if strategy == "next_btn_real":
-            btns = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page'], [title='Seuraava sivu']")
+            btns = page.locator("input.rgPageNext, button.rgPageNext, a.rgPageNext, [title='Next Page']")
             for i in range(btns.count()):
                 b = btns.nth(i)
                 is_dis = b.evaluate("el => Boolean(el.disabled || el.classList.contains('rgDisabled') || el.classList.contains('aspNetDisabled'))")
@@ -396,27 +387,6 @@ def _click_radgrid_next(page, target_page_num, strategy):
                     b.click(force=True, timeout=4000)
                     return True
             return False
-
-        if strategy == "dopostback":
-            return bool(page.evaluate(
-                """(targetStr) => {
-                    const links = Array.from(document.querySelectorAll('.rgNumPart a, .rgPager a'));
-                    for (const a of links) {
-                        if ((a.textContent || '').trim() === targetStr) {
-                            const href = a.getAttribute('href') || '';
-                            const m = href.match(/__doPostBack\\(['"]([^'"]+)['"]\\s*,\\s*['"]([^'"]*)['"]\\)/);
-                            if (m && typeof __doPostBack === 'function') {
-                                __doPostBack(m[1], m[2]);
-                                return true;
-                            }
-                            a.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                str(target_page_num),
-            ))
 
         if strategy == "telerik_api":
             return bool(page.evaluate(
@@ -447,13 +417,11 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
         for url in candidate_urls:
             print(f"[{league['name']}] Opening browser on {url}")
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.goto(url, wait_until="networkidle", timeout=45000)
                 page.wait_for_function(
                     """() => Array.from(document.querySelectorAll('tr.rgRow, tr.rgAltRow')).some(r => r.querySelectorAll('td').length >= 10)""",
-                    timeout=20000,
+                    timeout=18000,
                 )
-                page.wait_for_timeout(800)
-                _dismiss_overlays(page)
             except Exception:
                 continue
 
@@ -473,9 +441,9 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
 
                 next_batch = None
                 target_num = pages_scraped + 1
-                for strategy in ("num_link", "next_btn_real", "dopostback", "telerik_api"):
+                for strategy in ("num_link", "next_btn_real", "telerik_api"):
                     if _click_radgrid_next(page, target_num, strategy):
-                        cand = _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=10.0)
+                        cand = _wait_for_radgrid_change(page, league, prev_ids, timeout_sec=8.0)
                         if cand and any(k not in all_players for k in cand):
                             next_batch = cand
                             break
@@ -489,152 +457,6 @@ def scrape_all_players_playwright(browser, league, candidate_urls):
     finally:
         context.close()
     return all_players
-
-
-def _detect_ranking_category(title_text, headers):
-    # Decide which stat category a BestPlayerRankingComplete.aspx?rt=X page represents
-    blob = normalize_header(f"{title_text} {' '.join(headers)}")
-    h_join = " ".join(headers)
-
-    if any(k in blob for k in ["recep", "vastaa", "υποδοχ", "preluar", "mottagn", "fogad", "prijem", "посрещ"]):
-        return "reception"
-    if any(k in blob for k in ["block", "torjun", "μπλοκ", "blocaj", "sanc", "blok", "блок"]):
-        return "block"
-    if any(k in blob for k in ["ace", "serve", "assat", "syot", "ασοι", "σερβ", "servici", "ess", "asz", "nyit", "asov", "асов", "серв", "esa", "podan"]):
-        return "serve"
-    if any(k in blob for k in ["attack", "spik", "kill", "hyok", "επιθ", "atac", "anfall", "tamad", "napad", "атак", "utok"]):
-        return "attack"
-    if any(k in blob for k in ["scorer", "point", "piste", "ποντ", "punct", "poang", "pont", "poen", "bod", "точк", "body"]) or "pts" in h_join:
-        return "points"
-    return ""
-
-
-def scrape_best_player_rankings(session, league, existing_players):
-    # Backup & supplement via BestPlayerRankingComplete.aspx?ID={cid}&rt=1..8
-    base = league["base_url"].rstrip("/")
-    cid = str(league["competition_id"])
-    added_or_filled = 0
-
-    for rt in range(1, 9):
-        url = f"{base}/BestPlayerRankingComplete.aspx?ID={cid}&rt={rt}"
-        raw_html = fetch_html(session, url, timeout=20)
-        if not raw_html or "PlayerID=" not in raw_html:
-            continue
-
-        soup = BeautifulSoup(raw_html, "lxml")
-        title_els = soup.select("h1, h2, h3, [id*='Title'], [id*='LBL_Ranking'], [class*='Title']")
-        title_txt = " ".join(clean_text(el.get_text(" ")) for el in title_els[:5])
-
-        for tbl in soup.find_all("table"):
-            player_links = tbl.find_all("a", href=re.compile(r"PlayerID=\d+", re.IGNORECASE))
-            if len(player_links) < 5:
-                continue
-
-            trs = tbl.find_all("tr")
-            header_idx, headers = 0, []
-            for idx, tr in enumerate(trs[:4]):
-                ths = [normalize_header(c.get_text(" ")) for c in tr.find_all(["th", "td"])]
-                if len(ths) >= 4:
-                    header_idx, headers = idx, ths
-                    break
-
-            cat = _detect_ranking_category(title_txt, headers)
-            if not cat:
-                continue
-
-            i_team = find_col(headers, ["team", "club", "joukkue", "seura", "ομαδα", "echipa", "lag", "csapat", "klub", "отбор", "ekipa"])
-            i_matches = find_col(headers, ["matches", "ottelut", "αγωνες", "meciuri", "matcher", "meccs", "utakmice", "мачове", "zapasy", "m"])
-            i_sets = find_col(headers, ["sets", "erat", "σετ", "seturi", "set", "szett", "setovi", "геймове", "sety", "s"])
-            i_pct = next((i for i, h in enumerate(headers) if "%" in h or "pct" in h or "exc" in h or "pos" in h), None)
-
-            for tr in trs[header_idx + 1 :]:
-                a_el = tr.find("a", href=re.compile(r"PlayerID=\d+", re.IGNORECASE))
-                if not a_el:
-                    continue
-                full_p_url = urljoin(base + "/", a_el["href"])
-                pl_id = extract_query_param(full_p_url, "PlayerID")
-                if not pl_id:
-                    continue
-
-                cells = [clean_text(c.get_text(" ")) for c in tr.find_all(["td", "th"])]
-                if len(cells) < 4:
-                    continue
-
-                name = clean_text(a_el.get_text(" "))
-                team = cell_val(cells, i_team)
-
-                # Extract numeric columns (after player & team)
-                nums = []
-                for ci, val in enumerate(cells):
-                    if ci in (0, i_team, i_matches, i_sets):
-                        continue
-                    if re.search(r"\d", val) and val != name and val != team:
-                        is_pct_cell = "%" in val or (ci == i_pct)
-                        is_float_cell = ("," in val or "." in val) and not is_pct_cell
-                        nums.append((ci, to_float(val), is_pct_cell, is_float_cell))
-
-                if pl_id not in existing_players:
-                    existing_players[pl_id] = {
-                        "pl_id": pl_id, "url": full_p_url, "name": name, "team": team, "country": "",
-                        "matches": 0, "sets": 0, "points": 0, "break_points": 0, "won_lost": 0,
-                        "serve_total": 0, "aces": 0, "serve_errors": 0,
-                        "reception_total": 0, "reception_pos_pct": 0.0, "reception_perf_pct": 0.0,
-                        "attack_total": 0, "attack_points": 0, "attack_errors": 0, "attack_blocked": 0,
-                        "attack_pct": 0.0, "attack_eff_pct": 0.0, "blocks": 0,
-                    }
-                    added_or_filled += 1
-
-                rec = existing_players[pl_id]
-                if not rec["name"] and name:
-                    rec["name"] = name
-                if not rec["team"] and team:
-                    rec["team"] = team
-
-                m_val = to_int(cell_val(cells, i_matches))
-                s_val = to_int(cell_val(cells, i_sets))
-                if m_val > rec["matches"]:
-                    rec["matches"] = m_val
-                if s_val > rec["sets"]:
-                    rec["sets"] = s_val
-
-                # Fill missing category stats without overwriting complete RadGrid data
-                int_vals = [int(round(v)) for _, v, is_p, is_f in nums if not is_p and not is_f and v >= 0]
-                pct_vals = [round(v, 1) for _, v, is_p, _ in nums if is_p and 0 <= v <= 100]
-
-                if cat == "points" and rec["points"] == 0 and int_vals:
-                    rec["points"] = max(int_vals)
-                elif cat == "serve" and rec["aces"] == 0 and int_vals:
-                    rec["aces"] = min(int_vals) if len(int_vals) >= 2 and max(int_vals) > 5 * min(int_vals) else max(int_vals)
-                    if len(int_vals) >= 2 and max(int_vals) > rec["aces"]:
-                        rec["serve_total"] = max(rec["serve_total"], max(int_vals))
-                elif cat == "block" and rec["blocks"] == 0 and int_vals:
-                    rec["blocks"] = max(int_vals)
-                elif cat == "attack":
-                    if rec["attack_pct"] == 0.0 and pct_vals:
-                        rec["attack_pct"] = pct_vals[0]
-                    if rec["attack_total"] == 0 and len(int_vals) >= 2:
-                        rec["attack_total"] = max(int_vals)
-                        rec["attack_points"] = sorted(int_vals)[-2] if sorted(int_vals)[-2] <= rec["attack_total"] else 0
-                    elif rec["attack_points"] == 0 and int_vals:
-                        rec["attack_points"] = max(int_vals)
-                elif cat == "reception":
-                    if rec["reception_pos_pct"] == 0.0 and pct_vals:
-                        rec["reception_pos_pct"] = pct_vals[0]
-                        if len(pct_vals) >= 2:
-                            rec["reception_perf_pct"] = pct_vals[1]
-                    if rec["reception_total"] == 0 and int_vals:
-                        rec["reception_total"] = max(int_vals)
-            break
-
-    # Backfill total points if components exist
-    for rec in existing_players.values():
-        calc_pts = rec["attack_points"] + rec["aces"] + rec["blocks"]
-        if calc_pts > rec["points"]:
-            rec["points"] = calc_pts
-
-    if added_or_filled > 0:
-        print(f"[{league['name']}] BestPlayerRankingComplete (rt=1..8) added/filled {added_or_filled} players.")
-    return existing_players
 
 
 def discover_extra_players_from_teams(session, league, existing_players):
@@ -773,6 +595,290 @@ def enrich_player_profile(league, pl_id, data):
     }
 
 
+def _classify_ranking_span(span_id, page_title, main_txt, rt):
+    sid = (span_id or "").lower()
+    title = normalize_header(page_title)
+    is_pct = "%" in main_txt or "perc" in sid or "pct" in sid
+
+    # 1) Primary classification from the standardized DataProject span ID (language-independent)
+    if "scorer" in sid or "point" in sid:
+        return "points_set" if "set" in sid else "points_total"
+    if any(k in sid for k in ("server", "service", "ace")):
+        if "set" in sid:
+            return "aces_set"
+        return "aces_pct" if is_pct else "aces_total"
+    if "block" in sid or "wall" in sid or "mur" in sid:
+        return "blocks_set" if "set" in sid else "blocks_total"
+    if any(k in sid for k in ("spik", "attack", "kill")):
+        if "eff" in sid:
+            return "attack_eff"
+        if is_pct:
+            return "attack_pct"
+        return "attack_set" if "set" in sid else "attack_total"
+    if "receiv" in sid or "rec" in sid:
+        return "reception_perf" if any(k in sid for k in ("perf", "exc")) else "reception_pos"
+
+    # 2) Secondary classification from page title
+    if any(k in title for k in ("recep", "vastaa", "υποδοχ", "preluar", "mottagn", "fogad", "prijem", "посрещ")):
+        return "reception_perf" if any(k in title for k in ("perf", "exc", "erinom")) else "reception_pos"
+    if any(k in title for k in ("block", "torjun", "μπλοκ", "blocaj", "sanc", "blok", "блок")):
+        return "blocks_set" if any(k in title for k in ("set", "era", "σετ", "szett")) else "blocks_total"
+    if any(k in title for k in ("ace", "serv", "assat", "syot", "ασοι", "σερβ", "servici", "ess", "asz", "nyit", "асов", "серв")):
+        return "aces_set" if any(k in title for k in ("set", "era", "σετ", "szett")) else "aces_total"
+    if any(k in title for k in ("spik", "attack", "hyok", "επιθ", "atac", "anfall", "tamad", "napad", "атак")):
+        return "attack_pct" if is_pct else "attack_total"
+    if any(k in title for k in ("scorer", "point", "piste", "ποντ", "punct", "poang", "pont", "poen", "bod", "точк")):
+        return "points_set" if any(k in title for k in ("set", "era", "σετ", "szett")) else "points_total"
+
+    # 3) Fallback by standard DataProject rt index
+    rt_defaults = {
+        1: "points_set",
+        2: "points_total",
+        3: "aces_set",
+        4: "aces_total",
+        5: "blocks_set",
+        6: "blocks_total",
+        7: "attack_pct",
+        8: "reception_pos",
+    }
+    return rt_defaults.get(rt, "")
+
+
+def _parse_ranking_complete_items(soup):
+    items = []
+    # Match both first position (DIV_First_Position) and other positions (DIV_Other_Positions)
+    containers = soup.find_all("div", id=re.compile(r"LV_Ranking_ctrl\d+_DIV_", re.IGNORECASE))
+    if not containers:
+        seen = set()
+        for nm in soup.select(".Ranking_PlayerName, [id*='LBL_NameSurname']"):
+            parent = nm.parent
+            for _ in range(4):
+                if parent and parent.select_one(".Ranking_PlayerData, [id*='LBL_Best']"):
+                    if id(parent) not in seen:
+                        seen.add(id(parent))
+                        containers.append(parent)
+                    break
+                parent = parent.parent if parent else None
+
+    for box in containers:
+        name_el = box.select_one(".Ranking_PlayerName, [id*='LBL_NameSurname']")
+        data_el = box.select_one(".Ranking_PlayerData, [id*='LBL_Best']")
+        if not name_el or not data_el:
+            continue
+
+        name = clean_text(name_el.get_text(" "))
+        if not name:
+            continue
+
+        det_el = data_el.select_one(".Ranking_PlayerDataDetails")
+        det_txt = clean_text(det_el.get_text(" ")) if det_el else ""
+        full_data_txt = clean_text(data_el.get_text(" "))
+        main_txt = clean_text(full_data_txt.replace(det_txt, "", 1)) if det_txt else full_data_txt
+
+        # Parse (num/den) or (single) from details like "(125/26)"
+        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", det_txt)
+        f_num, f_den = (int(m_frac.group(1)), int(m_frac.group(2))) if m_frac else (0, 0)
+        m_single = re.search(r"\((\d+)\)", det_txt) if not m_frac else None
+        s_val = int(m_single.group(1)) if m_single else 0
+
+        items.append({
+            "name": name,
+            "span_id": data_el.get("id") or "",
+            "main_txt": main_txt,
+            "main_val": to_float(main_txt),
+            "f_num": f_num,
+            "f_den": f_den,
+            "s_val": s_val,
+        })
+    return items
+
+
+def apply_best_player_rankings_to_records(session, league, league_records):
+    # Enrich all league players using DataProject's complete rankings (rt=1..10)
+    base = league["base_url"].rstrip("/")
+    cid = str(league["competition_id"])
+    pid = str(league.get("pid", "")).strip()
+
+    by_key = {}
+    for rec in league_records:
+        nk = name_match_key(rec["name"])
+        if nk:
+            by_key.setdefault(nk, rec)
+
+    tables_used = 0
+    matched_ids = set()
+    created_new = 0
+
+    for rt in range(1, 11):
+        urls = [f"{base}/BestPlayerRankingComplete.aspx?ID={cid}&rt={rt}"]
+        if pid:
+            urls.append(f"{base}/BestPlayerRankingComplete.aspx?ID={cid}&PID={pid}&rt={rt}")
+
+        items = []
+        page_title = ""
+        for u in urls:
+            raw_html = fetch_html(session, u, timeout=20)
+            if not raw_html:
+                continue
+            soup = BeautifulSoup(raw_html, "lxml")
+            items = _parse_ranking_complete_items(soup)
+            if items:
+                title_els = soup.select("h1, h2, h3, [id*='Title'], [id*='RankingTitle'], [class*='Title']")
+                page_title = " ".join(clean_text(el.get_text(" ")) for el in title_els[:4])
+                break
+
+        if not items:
+            continue
+
+        tables_used += 1
+        sample_cat = _classify_ranking_span(items[0]["span_id"], page_title, items[0]["main_txt"], rt)
+        print(f"[{league['name']}] Ranking rt={rt} ({sample_cat}, span={items[0]['span_id']}): {len(items)} players")
+
+        for it in items:
+            cat = _classify_ranking_span(it["span_id"], page_title, it["main_txt"], rt)
+            if not cat:
+                continue
+
+            nk = name_match_key(it["name"])
+            if not nk:
+                continue
+
+            rec = by_key.get(nk)
+            if rec is None:
+                rec = {
+                    "player_id": f"{league['country']}_{cid}_rk_{slugify_text(it['name'])}",
+                    "season": league.get("season", "2026-27"),
+                    "league": league["name"],
+                    "country": league["country"],
+                    "gender": league.get("gender", ""),
+                    "name": it["name"],
+                    "team": "",
+                    "position": "Unknown",
+                    "raw_position": "",
+                    "class_year": "",
+                    "grad_status": "",
+                    "grad_2027": False,
+                    "height_cm": 0,
+                    "birth_year": 0,
+                    "age": 0,
+                    "nationality": "",
+                    "matches": 0, "sets": 0, "points": 0, "points_per_set": 0.0,
+                    "break_points": 0, "won_lost": 0,
+                    "serve_total": 0, "aces": 0, "aces_per_set": 0.0, "serve_errors": 0,
+                    "blocks": 0, "blocks_per_set": 0.0,
+                    "attack_total": 0, "attack_points": 0, "attack_errors": 0, "attack_blocked": 0,
+                    "attack_pct": 0.0, "attack_eff_pct": 0.0,
+                    "reception_total": 0, "reception_pos_pct": 0.0, "reception_perf_pct": 0.0,
+                    "profile_url": f"{base}/BestPlayerRankingComplete.aspx?ID={cid}&rt={rt}",
+                    "photo_url": "",
+                }
+                league_records.append(rec)
+                by_key[nk] = rec
+                created_new += 1
+
+            matched_ids.add(rec["player_id"])
+            val, f_num, f_den, s_val = it["main_val"], it["f_num"], it["f_den"], it["s_val"]
+
+            if cat == "points_set":
+                if f_num > 0:
+                    rec["points"] = max(rec["points"], f_num)
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+                if val > 0 and rec["points_per_set"] == 0.0:
+                    rec["points_per_set"] = round(val, 2)
+            elif cat == "points_total":
+                rec["points"] = max(rec["points"], f_num or int(round(val)))
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+                elif s_val > 0 and s_val <= 150:
+                    rec["sets"] = max(rec["sets"], s_val)
+            elif cat == "aces_set":
+                if f_num > 0:
+                    rec["aces"] = max(rec["aces"], f_num)
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+                if val > 0 and rec["aces_per_set"] == 0.0:
+                    rec["aces_per_set"] = round(val, 2)
+            elif cat == "aces_total":
+                rec["aces"] = max(rec["aces"], f_num or int(round(val)))
+                if f_den > 0:
+                    if rec["sets"] == 0 and f_den <= 150:
+                        rec["sets"] = f_den
+                    else:
+                        rec["serve_total"] = max(rec["serve_total"], f_den)
+            elif cat == "aces_pct":
+                if f_num > 0:
+                    rec["aces"] = max(rec["aces"], f_num)
+                if f_den > 0:
+                    rec["serve_total"] = max(rec["serve_total"], f_den)
+            elif cat == "blocks_set":
+                if f_num > 0:
+                    rec["blocks"] = max(rec["blocks"], f_num)
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+                if val > 0 and rec["blocks_per_set"] == 0.0:
+                    rec["blocks_per_set"] = round(val, 2)
+            elif cat == "blocks_total":
+                rec["blocks"] = max(rec["blocks"], f_num or int(round(val)))
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+                elif s_val > 0 and s_val <= 150:
+                    rec["sets"] = max(rec["sets"], s_val)
+            elif cat == "attack_pct":
+                if rec["attack_pct"] == 0.0 and 0 < val <= 100:
+                    rec["attack_pct"] = round(val, 1)
+                if f_num > 0:
+                    rec["attack_points"] = max(rec["attack_points"], f_num)
+                if f_den > 0:
+                    rec["attack_total"] = max(rec["attack_total"], f_den)
+            elif cat == "attack_eff":
+                if rec["attack_eff_pct"] == 0.0 and -100 <= val <= 100:
+                    rec["attack_eff_pct"] = round(val, 1)
+                if f_num > 0:
+                    rec["attack_points"] = max(rec["attack_points"], f_num)
+                if f_den > 0:
+                    rec["attack_total"] = max(rec["attack_total"], f_den)
+            elif cat == "attack_set":
+                if f_num > 0:
+                    rec["attack_points"] = max(rec["attack_points"], f_num)
+                if f_den > 0:
+                    rec["sets"] = max(rec["sets"], f_den)
+            elif cat == "attack_total":
+                rec["attack_points"] = max(rec["attack_points"], f_num or int(round(val)))
+                if f_den > 0:
+                    rec["attack_total"] = max(rec["attack_total"], f_den)
+            elif cat == "reception_pos":
+                if rec["reception_pos_pct"] == 0.0 and 0 < val <= 100:
+                    rec["reception_pos_pct"] = round(val, 1)
+                if f_den > 0:
+                    rec["reception_total"] = max(rec["reception_total"], f_den)
+                elif s_val > 0:
+                    rec["reception_total"] = max(rec["reception_total"], s_val)
+            elif cat == "reception_perf":
+                if rec["reception_perf_pct"] == 0.0 and 0 < val <= 100:
+                    rec["reception_perf_pct"] = round(val, 1)
+                if f_den > 0:
+                    rec["reception_total"] = max(rec["reception_total"], f_den)
+
+    # Recompute derived per-set & percentage metrics across all players
+    for rec in league_records:
+        calc_pts = rec["attack_points"] + rec["aces"] + rec["blocks"]
+        if calc_pts > rec["points"]:
+            rec["points"] = calc_pts
+        if rec["sets"] == 0 and rec["points"] > 0 and rec["points_per_set"] > 0:
+            rec["sets"] = max(1, int(round(rec["points"] / rec["points_per_set"])))
+        s = rec["sets"]
+        if s > 0:
+            rec["points_per_set"] = round(rec["points"] / s, 2)
+            rec["aces_per_set"] = round(rec["aces"] / s, 2)
+            rec["blocks_per_set"] = round(rec["blocks"] / s, 2)
+        if rec["attack_pct"] == 0.0 and rec["attack_total"] > 0 and rec["attack_points"] > 0:
+            rec["attack_pct"] = round(100.0 * rec["attack_points"] / rec["attack_total"], 1)
+
+    print(f"[{league['name']}] BestPlayerRankingComplete updated {len(matched_ids)} players ({created_new} new) across {tables_used} ranking tables.")
+    return league_records
+
+
 def apply_manual_overrides(df, overrides_path="data/manual_overrides.csv"):
     if not os.path.exists(overrides_path) or df.empty:
         return df
@@ -826,15 +932,18 @@ def main():
 
                 cand_urls = resolve_dataproject_stats_urls(session, league)
                 players = scrape_all_players_playwright(browser, league, cand_urls)
-                players = scrape_best_player_rankings(session, league, players)
                 players = discover_extra_players_from_teams(session, league, players)
 
+                league_records = []
                 with ThreadPoolExecutor(max_workers=12) as executor:
                     futures = [executor.submit(enrich_player_profile, league, pl_id, pdata) for pl_id, pdata in players.items()]
                     for fut in as_completed(futures):
                         rec = fut.result()
                         if rec:
-                            all_records.append(rec)
+                            league_records.append(rec)
+
+                league_records = apply_best_player_rankings_to_records(session, league, league_records)
+                all_records.extend(league_records)
         finally:
             browser.close()
 
